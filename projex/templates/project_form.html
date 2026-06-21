@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ "Edit" if project else "New" }} Project{% endblock %}
+
+{% block nav_extra %}
+  {% if project %}
+    <a href="{{ url_for('project_detail', pid=project.id) }}" class="btn btn-sm btn-ghost">← Back</a>
+  {% else %}
+    <a href="{{ url_for('index') }}" class="btn btn-sm btn-ghost">← Back</a>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+<h1>{{ "Edit" if project else "New project" }}</h1>
+<form method="post" class="form-card">
+  <label>
+    Name
+    <input type="text" name="name" required value="{{ project.name if project else '' }}" />
+  </label>
+  <label>
+    Status
+    <select name="status">
+      {% for s in ["active", "paused", "done"] %}
+        <option value="{{ s }}" {{ "selected" if project and project.status == s else "" }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    Description
+    <textarea name="description" rows="3">{{ project.description if project else '' }}</textarea>
+  </label>
+  <label>
+    Color
+    <input type="color" name="color" value="{{ project.color if project else '#4fa8c4' }}" />
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">{{ "Save changes" if project else "Create project" }}</button>
+    {% if project %}
+      <form method="post" action="{{ url_for('project_delete', pid=project.id) }}" style="display:inline" onsubmit="return confirm('Delete this project and all its data?')">
+        <button type="submit" class="btn btn-danger">Delete project</button>
+      </form>
+    {% endif %}
+  </div>
+</form>
+{% endblock %}

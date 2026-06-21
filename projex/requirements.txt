@@ -1,0 +1,6 @@
+# System packages required (install via your package manager):
+#   openSUSE:  sudo zypper install python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1
+#   Fedora:    sudo dnf install python3-gobject gtk4 libadwaita
+#   Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+#
+# libadwaita >= 1.4 required (for NavigationSplitView)

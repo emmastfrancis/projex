@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Edit Entry — {{ project.name }}{% endblock %}
+
+{% block nav_extra %}
+  <a href="{{ url_for('project_detail', pid=project.id) }}#writing" class="btn btn-sm btn-ghost">← Back</a>
+{% endblock %}
+
+{% block content %}
+<h1>Edit entry</h1>
+<form method="post" class="form-card">
+  <label>
+    Title
+    <input type="text" name="title" required value="{{ entry.title }}" />
+  </label>
+  <label>
+    Content
+    <textarea name="content" rows="10">{{ entry.content or '' }}</textarea>
+  </label>
+  <label>
+    Status
+    <select name="status">
+      <option value="draft" {{ "selected" if entry.status == "draft" }}>draft</option>
+      <option value="done" {{ "selected" if entry.status == "done" }}>done</option>
+    </select>
+  </label>
+  <label>
+    Date
+    <input type="date" name="date" value="{{ entry.date }}" required />
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">Save changes</button>
+    <a href="{{ url_for('project_detail', pid=project.id) }}#writing" class="btn btn-ghost">Cancel</a>
+  </div>
+</form>
+{% endblock %}

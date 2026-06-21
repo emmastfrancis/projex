@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Projects{% endblock %}
+
+{% block nav_extra %}
+  <a href="{{ url_for('project_new') }}" class="btn btn-sm">+ New project</a>
+{% endblock %}
+
+{% block content %}
+<h1>Projects</h1>
+
+{% if not projects %}
+  <p class="muted">No projects yet. <a href="{{ url_for('project_new') }}">Create one.</a></p>
+{% else %}
+  <div class="project-grid">
+    {% for p in projects %}
+    <a href="{{ url_for('project_detail', pid=p.id) }}" class="project-card" style="--card-color: {{ p.color }}">
+      <div class="card-accent"></div>
+      <div class="card-body">
+        <div class="card-header">
+          <span class="card-name">{{ p.name }}</span>
+          <span class="status-badge status-{{ p.status }}">{{ p.status }}</span>
+        </div>
+        {% if p.description %}
+        <p class="card-desc">{{ p.description }}</p>
+        {% endif %}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+{% endif %}
+{% endblock %}

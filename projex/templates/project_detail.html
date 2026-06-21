@@ -1,0 +1,281 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }}{% endblock %}
+
+{% block nav_extra %}
+  <a href="{{ url_for('index') }}" class="btn btn-sm btn-ghost">← All projects</a>
+  <a href="{{ url_for('project_edit', pid=project.id) }}" class="btn btn-sm">Edit project</a>
+{% endblock %}
+
+{% block content %}
+<div class="detail-header" style="--card-color: {{ project.color }}">
+  <div class="detail-accent"></div>
+  <div>
+    <h1>{{ project.name }}</h1>
+    <span class="status-badge status-{{ project.status }}">{{ project.status }}</span>
+    {% if project.description %}<p class="muted">{{ project.description }}</p>{% endif %}
+  </div>
+</div>
+
+<div class="tab-bar">
+  <a href="#timeline" class="tab-link">Timeline</a>
+  <a href="#todos" class="tab-link">To-dos</a>
+  <a href="#goals" class="tab-link">Goals</a>
+  <a href="#writing" class="tab-link">Writing log</a>
+</div>
+
+<!-- ── Timeline ──────────────────────────────────────── -->
+<section id="timeline" class="section">
+  <h2>Timeline</h2>
+
+  {% if milestones %}
+  <div class="gantt-wrap">
+    <canvas id="gantt-canvas"></canvas>
+  </div>
+  <div class="milestone-list">
+    {% for m in milestones %}
+    <div class="milestone-row">
+      <div class="milestone-info">
+        <strong>{{ m.title }}</strong>
+        <span class="muted">{{ m.start_date }} → {{ m.end_date }}</span>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-sm btn-ghost" onclick="openMilestoneEdit({{ m.id }}, '{{ m.title|e }}', '{{ m.start_date }}', '{{ m.end_date }}')">Edit</button>
+        <form method="post" action="{{ url_for('milestone_delete', mid=m.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-sm btn-ghost btn-danger-ghost">Delete</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">No milestones yet.</p>
+  {% endif %}
+
+  <details class="add-form">
+    <summary class="btn btn-sm">+ Add milestone</summary>
+    <form method="post" action="{{ url_for('milestone_new', pid=project.id) }}" class="inline-form">
+      <input type="text" name="title" placeholder="Milestone title" required />
+      <input type="date" name="start_date" value="{{ today }}" required />
+      <input type="date" name="end_date" value="{{ today }}" required />
+      <button type="submit" class="btn btn-sm">Add</button>
+    </form>
+  </details>
+</section>
+
+<!-- milestone edit modal -->
+<dialog id="milestone-modal" class="modal">
+  <form method="post" id="milestone-edit-form" class="form-card">
+    <h3>Edit milestone</h3>
+    <label>Title <input type="text" name="title" id="me-title" required /></label>
+    <label>Start <input type="date" name="start_date" id="me-start" required /></label>
+    <label>End <input type="date" name="end_date" id="me-end" required /></label>
+    <div class="form-actions">
+      <button type="submit" class="btn">Save</button>
+      <button type="button" class="btn btn-ghost" onclick="document.getElementById('milestone-modal').close()">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ── To-dos ─────────────────────────────────────────── -->
+<section id="todos" class="section">
+  <h2>To-dos</h2>
+  {% for t in todos %}
+  <div class="check-row {{ 'done' if t.done }}">
+    <form method="post" action="{{ url_for('todo_toggle', tid=t.id) }}" style="display:inline">
+      <button type="submit" class="check-btn" title="Toggle">{{ "☑" if t.done else "☐" }}</button>
+    </form>
+    <span class="check-text">{{ t.text }}</span>
+    {% if t.priority and t.priority != 'normal' %}
+      <span class="priority-tag priority-{{ t.priority }}">{{ t.priority }}</span>
+    {% endif %}
+    <form method="post" action="{{ url_for('todo_delete', tid=t.id) }}" class="del-form">
+      <button type="submit" class="btn-icon" title="Delete">×</button>
+    </form>
+  </div>
+  {% else %}
+  <p class="muted">No to-dos yet.</p>
+  {% endfor %}
+
+  <details class="add-form">
+    <summary class="btn btn-sm">+ Add to-do</summary>
+    <form method="post" action="{{ url_for('todo_new', pid=project.id) }}" class="inline-form">
+      <input type="text" name="text" placeholder="What needs doing?" required />
+      <select name="priority">
+        <option value="normal">normal</option>
+        <option value="high">high</option>
+        <option value="low">low</option>
+      </select>
+      <button type="submit" class="btn btn-sm">Add</button>
+    </form>
+  </details>
+</section>
+
+<!-- ── Goals ─────────────────────────────────────────── -->
+<section id="goals" class="section">
+  <h2>Goals</h2>
+  {% for g in goals %}
+  <div class="check-row {{ 'done' if g.done }}">
+    <form method="post" action="{{ url_for('goal_toggle', gid=g.id) }}" style="display:inline">
+      <button type="submit" class="check-btn" title="Toggle">{{ "☑" if g.done else "☐" }}</button>
+    </form>
+    <span class="check-text">{{ g.text }}</span>
+    <form method="post" action="{{ url_for('goal_delete', gid=g.id) }}" class="del-form">
+      <button type="submit" class="btn-icon" title="Delete">×</button>
+    </form>
+  </div>
+  {% else %}
+  <p class="muted">No goals yet.</p>
+  {% endfor %}
+
+  <details class="add-form">
+    <summary class="btn btn-sm">+ Add goal</summary>
+    <form method="post" action="{{ url_for('goal_new', pid=project.id) }}" class="inline-form">
+      <input type="text" name="text" placeholder="What are you aiming for?" required />
+      <button type="submit" class="btn btn-sm">Add</button>
+    </form>
+  </details>
+</section>
+
+<!-- ── Writing log ────────────────────────────────────── -->
+<section id="writing" class="section">
+  <h2>Writing log</h2>
+  {% for e in entries %}
+  <div class="entry-card">
+    <div class="entry-header">
+      <strong>{{ e.title }}</strong>
+      <span class="muted entry-meta">{{ e.date }} · <span class="status-badge status-{{ e.status }}">{{ e.status }}</span></span>
+    </div>
+    {% if e.content %}<p class="entry-content">{{ e.content }}</p>{% endif %}
+    <div class="row-actions">
+      <a href="{{ url_for('entry_edit', eid=e.id) }}" class="btn btn-sm btn-ghost">Edit</a>
+      <form method="post" action="{{ url_for('entry_delete', eid=e.id) }}" style="display:inline">
+        <button type="submit" class="btn btn-sm btn-ghost btn-danger-ghost">Delete</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <p class="muted">No entries yet.</p>
+  {% endfor %}
+
+  <details class="add-form">
+    <summary class="btn btn-sm">+ Add entry</summary>
+    <form method="post" action="{{ url_for('entry_new', pid=project.id) }}" class="inline-form inline-form-col">
+      <input type="text" name="title" placeholder="Entry title" required />
+      <textarea name="content" rows="4" placeholder="Write something…"></textarea>
+      <div class="form-row">
+        <select name="status">
+          <option value="draft">draft</option>
+          <option value="done">done</option>
+        </select>
+        <input type="date" name="date" value="{{ today }}" required />
+        <button type="submit" class="btn btn-sm">Add</button>
+      </div>
+    </form>
+  </details>
+</section>
+
+<script>
+// ── Gantt canvas chart ───────────────────────────────────────────────────────
+(function () {
+  const milestones = {{ milestones | tojson }};
+  if (!milestones.length) return;
+
+  const canvas = document.getElementById("gantt-canvas");
+  if (!canvas) return;
+
+  const ROW_H = 36, PAD = 12, LABEL_W = 180, HDR_H = 28;
+  const dates = milestones.flatMap(m => [new Date(m.start_date), new Date(m.end_date)]);
+  const minD = new Date(Math.min(...dates));
+  const maxD = new Date(Math.max(...dates));
+  // add padding
+  minD.setDate(minD.getDate() - 3);
+  maxD.setDate(maxD.getDate() + 3);
+  const totalDays = (maxD - minD) / 86400000;
+
+  const W = Math.max(600, canvas.parentElement.clientWidth || 700);
+  const BAR_W = W - LABEL_W - PAD * 2;
+  const H = HDR_H + milestones.length * ROW_H + PAD;
+
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--gantt-color").trim() || "#4fa8c4";
+
+  ctx.fillStyle = "#1a2030";
+  ctx.fillRect(0, 0, W, H);
+
+  // header grid lines & month labels
+  ctx.fillStyle = "#7a8499";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textAlign = "left";
+
+  function xOf(d) {
+    return LABEL_W + PAD + ((d - minD) / 86400000 / totalDays) * BAR_W;
+  }
+
+  // draw month tick marks
+  const cur = new Date(minD);
+  cur.setDate(1);
+  while (cur <= maxD) {
+    const x = xOf(cur);
+    ctx.fillStyle = "rgba(122,132,153,0.3)";
+    ctx.fillRect(x, 0, 1, H);
+    ctx.fillStyle = "#7a8499";
+    ctx.fillText(cur.toLocaleString("default", { month: "short", year: "2-digit" }), x + 3, 14);
+    cur.setMonth(cur.getMonth() + 1);
+  }
+
+  // rows
+  milestones.forEach((m, i) => {
+    const y = HDR_H + i * ROW_H;
+    const x1 = xOf(new Date(m.start_date));
+    const x2 = xOf(new Date(m.end_date));
+    const barW = Math.max(6, x2 - x1);
+
+    // zebra
+    if (i % 2 === 0) {
+      ctx.fillStyle = "rgba(255,255,255,0.03)";
+      ctx.fillRect(0, y, W, ROW_H);
+    }
+
+    // label
+    ctx.fillStyle = "#c8ccd8";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(m.title.length > 22 ? m.title.slice(0, 21) + "…" : m.title, LABEL_W - 6, y + ROW_H / 2 + 4);
+
+    // bar
+    ctx.fillStyle = accent;
+    const bx = x1, by = y + 7, bh = ROW_H - 14;
+    const r = 4;
+    ctx.beginPath();
+    ctx.moveTo(bx + r, by);
+    ctx.arcTo(bx + barW, by, bx + barW, by + bh, r);
+    ctx.arcTo(bx + barW, by + bh, bx, by + bh, r);
+    ctx.arcTo(bx, by + bh, bx, by, r);
+    ctx.arcTo(bx, by, bx + barW, by, r);
+    ctx.closePath();
+    ctx.fill();
+  });
+})();
+
+// ── Milestone edit modal ─────────────────────────────────────────────────────
+function openMilestoneEdit(id, title, start, end) {
+  document.getElementById("milestone-edit-form").action = "/milestone/" + id + "/edit";
+  document.getElementById("me-title").value = title;
+  document.getElementById("me-start").value = start;
+  document.getElementById("me-end").value = end;
+  document.getElementById("milestone-modal").showModal();
+}
+
+// ── Smooth scroll to anchor on load ─────────────────────────────────────────
+window.addEventListener("load", () => {
+  const hash = location.hash;
+  if (hash) {
+    const el = document.querySelector(hash);
+    if (el) el.scrollIntoView({ behavior: "smooth" });
+  }
+});
+</script>
+{% endblock %}

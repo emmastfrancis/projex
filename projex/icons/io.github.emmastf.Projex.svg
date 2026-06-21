@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5fc0db"/>
+      <stop offset="1" stop-color="#2d8aa8"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="20" x2="0" y2="110" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef4f7"/>
+    </linearGradient>
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- App background rounded square -->
+  <rect width="128" height="128" rx="26" fill="url(#bg)"/>
+
+  <!-- Subtle inner highlight at top -->
+  <rect width="128" height="64" rx="26" fill="white" opacity="0.08"/>
+  <rect y="38" width="128" height="26" fill="white" opacity="0"/>
+
+  <!-- Card / document -->
+  <rect x="17" y="19" width="94" height="92" rx="10" fill="url(#card)" filter="url(#shadow)"/>
+
+  <!-- Card top accent strip -->
+  <rect x="17" y="19" width="94" height="13" rx="10" fill="#4fa8c4" opacity="0.35"/>
+  <rect x="17" y="25" width="94" height="7" fill="#4fa8c4" opacity="0.35"/>
+
+  <!-- ── Row 1: done ── -->
+  <!-- Checkbox (green/checked) -->
+  <rect x="27" y="44" width="15" height="15" rx="4" fill="#26a269"/>
+  <!-- Checkmark -->
+  <path d="M30.5 51.5 l3.5 3.5 l6 -7" stroke="white" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Text bar (full, done) -->
+  <rect x="48" y="48" width="48" height="7" rx="3.5" fill="#c4d5dc"/>
+
+  <!-- ── Row 2: active ── -->
+  <!-- Checkbox (blue) -->
+  <rect x="27" y="65" width="15" height="15" rx="4" fill="#3584e4"/>
+  <!-- Partial fill indicator -->
+  <rect x="29" y="67" width="6" height="11" rx="1.5" fill="white" opacity="0.35"/>
+  <!-- Text bar -->
+  <rect x="48" y="69" width="38" height="7" rx="3.5" fill="#c4d5dc"/>
+
+  <!-- ── Row 3: pending ── -->
+  <!-- Checkbox (outline only) -->
+  <rect x="27" y="86" width="15" height="15" rx="4" fill="none" stroke="#b8cdd6" stroke-width="2"/>
+  <!-- Text bar (shorter, greyed) -->
+  <rect x="48" y="90" width="28" height="7" rx="3.5" fill="#d8e7ed"/>
+</svg>
