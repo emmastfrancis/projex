@@ -11,7 +11,7 @@ import random
 from datetime import date, datetime, timedelta
 
 APP_ID = "io.github.emmastf.Projex"
-VERSION = "0.1.29"
+VERSION = "0.1.30"
 _CHANGELOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHANGELOG.md")
 _data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 _data_dir = os.path.join(_data_home, "projex")
@@ -126,33 +126,115 @@ def _progress_quip(pct, total):
     return "Absolutely crushed it! You legend 🎉"
 
 
-def expand_date_shortcut(text):
-    """Expand +Nd/+Nw/+Nm shortcuts to ISO date strings. Returns text unchanged if not a shortcut."""
-    import re
-    m = re.fullmatch(r'\+(\d+)([dwm])', text.strip(), re.IGNORECASE)
-    if not m:
-        return text
-    n, unit = int(m.group(1)), m.group(2).lower()
+def parse_natural_date(text):
+    """
+    Parse natural language date input → ISO date string, or return text unchanged.
+    Handles:
+      +7d / +2w / +1m  (existing shortcuts)
+      today, tomorrow, yesterday
+      monday/tuesday/... (next occurrence of that weekday)
+      jan 5 / june 5 / 5 june / january 5
+      2026-06-15  (already ISO — pass through)
+      due monday / due june 5  (strip leading "due ")
+    """
+    import re, calendar as _cal
+
+    raw = text.strip()
+    if not raw:
+        return raw
+
+    # strip leading "due " (case-insensitive)
+    s = re.sub(r'^due\s+', '', raw, flags=re.IGNORECASE).strip()
+
     today = date.today()
-    if unit == 'd':
-        return (today + timedelta(days=n)).isoformat()
-    elif unit == 'w':
-        return (today + timedelta(weeks=n)).isoformat()
-    else:  # months — approximate with 30 days
-        y, mo = divmod(today.month - 1 + n, 12)
-        mo += 1
-        import calendar
-        last_day = calendar.monthrange(today.year + y, mo)[1]
-        return today.replace(year=today.year + y, month=mo, day=min(today.day, last_day)).isoformat()
+
+    # +Nd/+Nw/+Nm shortcuts
+    m = re.fullmatch(r'\+(\d+)([dwm])', s, re.IGNORECASE)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        if unit == 'd':
+            return (today + timedelta(days=n)).isoformat()
+        elif unit == 'w':
+            return (today + timedelta(weeks=n)).isoformat()
+        else:
+            y, mo = divmod(today.month - 1 + n, 12)
+            mo += 1
+            last_day = _cal.monthrange(today.year + y, mo)[1]
+            return today.replace(year=today.year + y, month=mo,
+                                 day=min(today.day, last_day)).isoformat()
+
+    # relative words
+    sl = s.lower()
+    if sl in ("today",):
+        return today.isoformat()
+    if sl in ("tomorrow",):
+        return (today + timedelta(days=1)).isoformat()
+    if sl in ("yesterday",):
+        return (today - timedelta(days=1)).isoformat()
+
+    # weekday names
+    WEEKDAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+    if sl in WEEKDAYS:
+        target_wd = WEEKDAYS.index(sl)
+        days_ahead = (target_wd - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # next occurrence
+        return (today + timedelta(days=days_ahead)).isoformat()
+
+    # month name lookup
+    MONTHS = {mn.lower(): i+1 for i, mn in enumerate(_cal.month_name) if mn}
+    MONTHS_SHORT = {mn.lower(): i+1 for i, mn in enumerate(_cal.month_abbr) if mn}
+    MONTHS.update(MONTHS_SHORT)
+
+    # "june 5" or "jun 5"
+    m2 = re.fullmatch(r'([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?', sl)
+    if m2 and m2.group(1) in MONTHS:
+        month = MONTHS[m2.group(1)]
+        day = int(m2.group(2))
+        year = today.year
+        try:
+            d = date(year, month, day)
+            if d < today:
+                d = date(year + 1, month, day)
+            return d.isoformat()
+        except ValueError:
+            pass
+
+    # "5 june" or "5th june"
+    m3 = re.fullmatch(r'(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)', sl)
+    if m3 and m3.group(2) in MONTHS:
+        month = MONTHS[m3.group(2)]
+        day = int(m3.group(1))
+        year = today.year
+        try:
+            d = date(year, month, day)
+            if d < today:
+                d = date(year + 1, month, day)
+            return d.isoformat()
+        except ValueError:
+            pass
+
+    # already ISO format
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
+        return s
+
+    return raw  # unrecognised — return as-is
+
+
+def expand_date_shortcut(text):
+    """Thin wrapper around parse_natural_date for backwards compat."""
+    return parse_natural_date(text)
 
 
 def _wire_date_shortcut(entry_row):
-    """Expand shortcut when the user presses Enter in a date EntryRow."""
-    def _expand(row):
-        expanded = expand_date_shortcut(row.get_text())
-        if expanded != row.get_text():
+    """Expand date on Enter; also expand on focus-out."""
+    def _expand(row, *_):
+        raw = row.get_text().strip()
+        expanded = parse_natural_date(raw)
+        if expanded != raw:
             row.set_text(expanded)
     entry_row.connect("entry-activated", _expand)
+    entry_row.connect("notify::has-focus", lambda r, _: _expand(r) if not r.has_focus() else None)
 
 
 def normalize_tag_input(raw):
@@ -365,6 +447,7 @@ def migrate_db():
             "ALTER TABLE goal ADD COLUMN notes       TEXT    DEFAULT ''",
             "ALTER TABLE goal ADD COLUMN blocked_by  INTEGER DEFAULT 0",
             "ALTER TABLE todo ADD COLUMN goal_id     INTEGER DEFAULT NULL",
+            "ALTER TABLE todo ADD COLUMN recur_end_date TEXT DEFAULT ''",
         ]:
             try:
                 c.execute(sql)
@@ -773,14 +856,15 @@ def section_page(title, content_widget, extra_header_widgets=None):
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None):
         super().__init__()
         self._items = items
         self._accent = accent
         self._view_start = view_start
         self._view_end = view_end
         self._show_project_label = show_project_label
-        self.set_content_height(max(80, len(items) * 36 + 48))
+        self._tasks = tasks or []
+        self.set_content_height(max(80, len(items) * 36 + 48 + (80 if (tasks or []) else 0)))
         self.set_hexpand(True)
         self.set_can_target(False)
         self.set_draw_func(self._draw)
@@ -977,6 +1061,42 @@ class _GanttDrawArea(Gtk.DrawingArea):
             cr.close_path()
             cr.fill()
 
+        # Task due-date markers (triangles below goal bars)
+        if self._tasks:
+            marker_y = HDR_H + len(items) * ROW_H + 8
+            cr.set_font_size(9)
+            for task in self._tasks:
+                dd = task.get("due_date") or ""
+                if not dd:
+                    continue
+                try:
+                    td = datetime.strptime(dd, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if self._view_start and self._view_end and (td < self._view_start or td > self._view_end):
+                    continue
+                tx = x_of(td)
+                priority = task.get("priority") or "normal"
+                # triangle colour by priority
+                tcolor = {"high": (0.88, 0.11, 0.14, 0.85),
+                          "low":  (0.21, 0.52, 0.89, 0.85)}.get(priority, (0.95, 0.80, 0.05, 0.85))
+                cr.set_source_rgba(*tcolor)
+                cr.move_to(tx, marker_y)
+                cr.line_to(tx - 5, marker_y - 9)
+                cr.line_to(tx + 5, marker_y - 9)
+                cr.close_path()
+                cr.fill()
+                # Task label (rotated 45 degrees to avoid overlap)
+                label = (task.get("text") or "")[:16]
+                cr.set_source_rgba(0.78, 0.80, 0.87, 0.80)
+                cr.save()
+                cr.translate(tx + 3, marker_y + 2)
+                cr.rotate(-math.pi / 4)
+                cr.show_text(label)
+                cr.restore()
+            # increase content height for task markers
+            self.set_content_height(max(80, len(items) * 36 + 48 + (80 if self._tasks else 0)))
+
 
 class GanttChart(Gtk.Box):
     """Gantt chart widget showing goals for a project (or all projects if pid=None)."""
@@ -1055,7 +1175,23 @@ class GanttChart(Gtk.Box):
             project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None))
+        # Fetch tasks with due dates for this project (or all projects)
+        if self._pid is None:
+            with get_db() as c:
+                task_rows = c.execute(
+                    "SELECT t.text, t.due_date, t.priority, p.color AS project_color "
+                    "FROM todo t JOIN project p ON t.project_id=p.id "
+                    "WHERE t.due_date != '' AND t.done=0 AND p.status != 'archived'"
+                ).fetchall()
+        else:
+            with get_db() as c:
+                task_rows = c.execute(
+                    "SELECT text, due_date, priority FROM todo WHERE project_id=? AND due_date != '' AND done=0",
+                    (self._pid,)
+                ).fetchall()
+        tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
+
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list)
         self._chart_box.append(da)
 
     def _in_range(self, item, vstart, vend):
@@ -1535,6 +1671,9 @@ class QuickTaskDialog(Adw.Window):
         self._pri.set_valign(Gtk.Align.CENTER)
         pri_row.add_suffix(self._pri)
         grp.add(pri_row)
+        self._entry_due = Adw.EntryRow(title="Due date (e.g. monday, june 5, +7d)")
+        _wire_date_shortcut(self._entry_due)
+        grp.add(self._entry_due)
         box.append(grp)
         btn = Gtk.Button(label="Add task", margin_top=18)
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
@@ -1548,13 +1687,14 @@ class QuickTaskDialog(Adw.Window):
         if not raw: return
         text, tags = parse_tags_from_text(raw)
         priority = PRIORITIES[self._pri.get_selected()]
+        due_date = parse_natural_date(self._entry_due.get_text().strip()) or None
         with get_db() as c:
             new_pos = (c.execute(
                 "SELECT COALESCE(MAX(order_pos)+1,0) FROM todo WHERE project_id=? AND done=0",
                 (self._pid,)).fetchone()[0])
             c.execute(
-                "INSERT INTO todo (project_id,text,priority,tags,order_pos) VALUES (?,?,?,?,?)",
-                (self._pid, text, priority, tags, new_pos),
+                "INSERT INTO todo (project_id,text,priority,tags,order_pos,due_date) VALUES (?,?,?,?,?,?)",
+                (self._pid, text, priority, tags, new_pos, due_date),
             )
         if self._on_save: self._on_save()
         self.close()
@@ -1564,14 +1704,15 @@ class TodoEditDialog(Adw.Window):
     def __init__(self, parent, todo, on_save=None):
         super().__init__(
             title="Edit Task", modal=True, transient_for=parent,
-            default_width=420, default_height=380, resizable=True,
+            default_width=420, default_height=580, resizable=True,
         )
         self._todo = todo
         self._on_save = on_save
 
         tv = Adw.ToolbarView()
         tv.add_top_bar(Adw.HeaderBar())
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
 
         grp = Adw.PreferencesGroup()
@@ -1583,11 +1724,6 @@ class TodoEditDialog(Adw.Window):
         self._tags = Adw.EntryRow(title="Labels (e.g. #design #urgent)")
         self._tags.set_text(safe_col(todo, "tags"))
         grp.add(self._tags)
-
-        self._due = Adw.EntryRow(title="Due date  (+Nd / +Nw / +Nm, optional)")
-        self._due.set_text(safe_col(todo, "due_date"))
-        _wire_date_shortcut(self._due)
-        grp.add(self._due)
 
         pri_row = Adw.ActionRow(title="Priority")
         self._pri = Gtk.DropDown.new_from_strings(PRIORITIES)
@@ -1606,6 +1742,11 @@ class TodoEditDialog(Adw.Window):
         recur_box.append(Gtk.Label(label="days", valign=Gtk.Align.CENTER))
         recur_row.add_suffix(recur_box)
         grp.add(recur_row)
+
+        self._recur_end = Adw.EntryRow(title="Stop repeating after (date, optional)")
+        self._recur_end.set_text(safe_col(todo, "recur_end_date") or "")
+        _wire_date_shortcut(self._recur_end)
+        grp.add(self._recur_end)
 
         blocked_row = Adw.ActionRow(title="Blocked by",
                                     subtitle="ID of task that must complete first (0 = none)")
@@ -1633,14 +1774,61 @@ class TodoEditDialog(Adw.Window):
         goal_row.add_suffix(self._goal_drop)
         grp.add(goal_row)
 
-        for er in (self._text, self._tags, self._due):
+        for er in (self._text, self._tags):
             er.connect("entry-activated", self._save)
+
+        # ── Due date group with calendar ──────────────────────
+        due_grp = Adw.PreferencesGroup(title="Due date")
+        self._due = Adw.EntryRow(title="Date (e.g. monday, june 5, +7d, or YYYY-MM-DD)")
+        self._due.set_text(safe_col(todo, "due_date") or "")
+        _wire_date_shortcut(self._due)
+        due_grp.add(self._due)
+
+        self._due_cal = Gtk.Calendar()
+        self._due_cal.add_css_class("card")
+        _cal_guard = [False]
+        _no_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
+        _no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        _no_scroll.connect("scroll", lambda _c, _dx, _dy: True)
+        self._due_cal.add_controller(_no_scroll)
+
+        def _cal_set_due(date_str):
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                _cal_guard[0] = True
+                self._due_cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+                _cal_guard[0] = False
+            except Exception:
+                pass
+
+        def _on_due_cal(cal):
+            if _cal_guard[0]: return
+            gdt = cal.get_date()
+            ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
+            _cal_guard[0] = True
+            self._due.set_text(ds)
+            _cal_guard[0] = False
+
+        def _on_due_text_changed(*_):
+            if _cal_guard[0]: return
+            val = parse_natural_date(self._due.get_text().strip())
+            _cal_set_due(val)
+
+        self._due_cal.connect("day-selected", _on_due_cal)
+        self._due.connect("notify::text", _on_due_text_changed)
+        if safe_col(todo, "due_date"):
+            _cal_set_due(safe_col(todo, "due_date"))
+
         box.append(grp)
-        btn = Gtk.Button(label="Save", margin_top=18)
+        box.append(due_grp)
+        box.append(self._due_cal)
+        btn = Gtk.Button(label="Save", margin_top=6)
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
         box.append(btn)
-        tv.set_content(box)
+        scroll.set_child(box)
+        tv.set_content(scroll)
         self.set_content(tv)
 
     def _save(self, _):
@@ -1650,12 +1838,13 @@ class TodoEditDialog(Adw.Window):
         tags       = normalize_tag_input(self._tags.get_text())
         priority   = PRIORITIES[self._pri.get_selected()]
         recur_days = int(self._recur_spin.get_value())
-        due_date   = expand_date_shortcut(self._due.get_text().strip()) or None
+        recur_end_date = parse_natural_date(self._recur_end.get_text().strip()) if self._recur_end.get_text().strip() else ""
+        due_date   = parse_natural_date(self._due.get_text().strip()) or None
         goal_id = self._goal_ids[self._goal_drop.get_selected()]
         with get_db() as c:
             c.execute(
-                "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, blocked_by=?, due_date=?, goal_id=? WHERE id=?",
-                (text, tags, priority, recur_days, int(self._blocked_spin.get_value()), due_date, goal_id, self._todo["id"]),
+                "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, recur_end_date=?, blocked_by=?, due_date=?, goal_id=? WHERE id=?",
+                (text, tags, priority, recur_days, recur_end_date, int(self._blocked_spin.get_value()), due_date, goal_id, self._todo["id"]),
             )
         if self._on_save:
             self._on_save()
@@ -1696,6 +1885,8 @@ class TodosView(Gtk.Box):
         self._selected_ids = set()
         self._row_checks   = {}
         self._filter_tag   = None
+        self._filter_tags  = set()   # replaces single _filter_tag
+        self._sort_by      = "order" # options: "order", "alpha", "priority", "due", "overdue"
 
         tb = tip_banner("tasks",
             "Type #tag in a task name to label it. Use Select for bulk actions. "
@@ -1733,7 +1924,7 @@ class TodosView(Gtk.Box):
         self._entry_tags = Adw.EntryRow(title="Labels (e.g. #design #urgent, optional)")
         add_grp.add(self._entry_tags)
 
-        self._entry_due = Adw.EntryRow(title="Due date (optional, +7d / +2w / +1m)")
+        self._entry_due = Adw.EntryRow(title="Due date (e.g. monday, june 5, +7d, optional)")
         _wire_date_shortcut(self._entry_due)
         add_grp.add(self._entry_due)
 
@@ -1795,6 +1986,14 @@ class TodosView(Gtk.Box):
 
     def _on_tag_filter(self, tag, active):
         self._filter_tag = tag if active else None
+        if active:
+            self._filter_tags.add(tag)
+        else:
+            self._filter_tags.discard(tag)
+        GLib.idle_add(self._build_content)
+
+    def _on_sort_changed(self):
+        self._sort_by = self._sort_keys[self._sort_drop.get_selected()]
         GLib.idle_add(self._build_content)
 
     def _build_content(self):
@@ -1804,6 +2003,24 @@ class TodosView(Gtk.Box):
         undone = [t for t in todos if not t["done"]]
         done   = [t for t in todos if t["done"]]
 
+        # ── Sort undone tasks ──────────────────────────────────
+        today_iso = date.today().isoformat()
+        if self._sort_by == "alpha":
+            undone.sort(key=lambda t: t["text"].lower())
+        elif self._sort_by == "priority":
+            _pri_order = {"high": 0, "normal": 1, "low": 2}
+            undone.sort(key=lambda t: _pri_order.get(safe_col(t, "priority") or "normal", 1))
+        elif self._sort_by == "due":
+            undone.sort(key=lambda t: safe_col(t, "due_date") or "9999-99-99")
+        elif self._sort_by == "overdue":
+            def _overdue_key(t):
+                dd = safe_col(t, "due_date")
+                if dd and dd < today_iso:
+                    return (0, dd)
+                return (1, dd or "9999-99-99")
+            undone.sort(key=_overdue_key)
+        # else: keep DB order (order_pos)
+
         # ── Rebuild tag chips ──────────────────────────────────
         clear_box(self._chips_bar)
         all_tags = sorted({tag for t in todos for tag in get_tags(safe_col(t, "tags"))})
@@ -1811,23 +2028,52 @@ class TodosView(Gtk.Box):
         for tag in all_tags:
             chip = Gtk.ToggleButton(label=f"#{tag}")
             chip.add_css_class("pill"); chip.add_css_class("flat")
-            chip.set_active(tag == self._filter_tag)
+            chip.set_active(tag in self._filter_tags)
             def _on_chip_toggled(btn, tg=tag):
                 if _building[0]:
                     return
-                self._filter_tag = tg if btn.get_active() else None
+                if btn.get_active():
+                    self._filter_tags.add(tg)
+                else:
+                    self._filter_tags.discard(tg)
                 GLib.idle_add(self._build_content)
             chip.connect("toggled", _on_chip_toggled)
             self._chips_bar.append(chip)
+        if self._filter_tags:
+            clear_chip = Gtk.Button(label="✕ Clear")
+            clear_chip.add_css_class("pill"); clear_chip.add_css_class("flat")
+            clear_chip.add_css_class("error")
+            clear_chip.connect("clicked", lambda _: (self._filter_tags.clear(), GLib.idle_add(self._build_content)))
+            self._chips_bar.append(clear_chip)
         _building[0] = False
         self._chips_bar.set_visible(bool(all_tags))
 
         # ── Apply active tag filter ────────────────────────────
-        if self._filter_tag:
-            undone = [t for t in undone
-                      if self._filter_tag in get_tags(safe_col(t, "tags"))]
+        if self._filter_tags:
+            undone = [t for t in undone if any(
+                tag in get_tags(safe_col(t, "tags")) for tag in self._filter_tags
+            )]
+            done = [t for t in done if any(
+                tag in get_tags(safe_col(t, "tags")) for tag in self._filter_tags
+            )]
 
         active_grp = Adw.PreferencesGroup(title="Tasks")
+
+        # ── Sort bar ───────────────────────────────────────────
+        sort_bar = Gtk.Box(spacing=6, margin_top=4, margin_bottom=2)
+        sort_lbl = Gtk.Label(label="Sort:")
+        sort_lbl.add_css_class("caption"); sort_lbl.add_css_class("dim-label")
+        sort_bar.append(sort_lbl)
+        SORT_OPTS = [("order", "Default"), ("alpha", "A-Z"), ("priority", "Priority"),
+                     ("due", "Due date"), ("overdue", "Overdue first")]
+        self._sort_drop = Gtk.DropDown.new_from_strings([label for _, label in SORT_OPTS])
+        self._sort_keys = [key for key, _ in SORT_OPTS]
+        self._sort_drop.set_valign(Gtk.Align.CENTER)
+        cur_sort_idx = self._sort_keys.index(self._sort_by) if self._sort_by in self._sort_keys else 0
+        self._sort_drop.set_selected(cur_sort_idx)
+        self._sort_drop.connect("notify::selected", lambda d, _: self._on_sort_changed())
+        sort_bar.append(self._sort_drop)
+        self._content.append(sort_bar)
 
         # Header suffix buttons: pick + bulk select
         hdr_box = Gtk.Box(spacing=4)
@@ -2154,15 +2400,19 @@ class TodosView(Gtk.Box):
                 c.execute("UPDATE todo SET done=1, completed_date=? WHERE id=?", (today, tid))
                 recur = int(safe_col(r, "recur_days") or 0)
                 if recur > 0:
-                    due_back = (date.today() + timedelta(days=recur)).isoformat()
-                    c.execute(
-                        "INSERT INTO todo (project_id, text, done, priority, tags, "
-                        "order_pos, completed_date, recur_days, estimate_mins, blocked_by) "
-                        "VALUES (?,?,0,?,?,0,?,?,?,0)",
-                        (r["project_id"], r["text"], safe_col(r,"priority") or "normal",
-                         safe_col(r,"tags") or "", due_back, recur,
-                         int(safe_col(r,"estimate_mins") or 0)),
-                    )
+                    recur_end = safe_col(r, "recur_end_date") or ""
+                    if recur_end and date.today().isoformat() >= recur_end:
+                        pass  # past end date, don't recreate
+                    else:
+                        due_back = (date.today() + timedelta(days=recur)).isoformat()
+                        c.execute(
+                            "INSERT INTO todo (project_id, text, done, priority, tags, "
+                            "order_pos, completed_date, recur_days, recur_end_date, estimate_mins, blocked_by) "
+                            "VALUES (?,?,0,?,?,0,?,?,?,?,0)",
+                            (r["project_id"], r["text"], safe_col(r,"priority") or "normal",
+                             safe_col(r,"tags") or "", due_back, recur, recur_end,
+                             int(safe_col(r,"estimate_mins") or 0)),
+                        )
         GLib.idle_add(self._build_content)
 
     def _update_priority(self, tid, priority):
@@ -2966,44 +3216,10 @@ class HomeView(Gtk.Box):
             self.append(sp)
             return
 
-        # ── Health alerts ─────────────────────────────
-        alerts = []
-        for p in [x for x in projects if x["status"] not in ("archived",)]:
-            color, reason = project_health(p["id"])
-            if color == "red":
-                alerts.append((p, reason, "error", "timeline"))
-            elif color == "yellow":
-                alerts.append((p, reason, "warning", "tasks"))
-        if alerts:
-            alert_lb = Gtk.ListBox()
-            alert_lb.add_css_class("boxed-list")
-            alert_lb.set_selection_mode(Gtk.SelectionMode.NONE)
-            _alert_meta = []
-            for p, reason, css, section in alerts:
-                emoji = safe_col(p, "emoji") or suggest_emoji(p["name"])
-                row = Adw.ActionRow(title=f"{emoji}  {p['name']}")
-                row.set_subtitle(f"{reason} — click to view")
-                dot = Gtk.Label(label="●")
-                dot.add_css_class(css); dot.set_valign(Gtk.Align.CENTER)
-                row.add_prefix(dot)
-                chev = Gtk.Image(icon_name="go-next-symbolic")
-                chev.add_css_class("dim-label"); row.add_suffix(chev)
-                row.set_activatable(True)
-                alert_lb.append(row)
-                _alert_meta.append((p["id"], section))
-
-            def _alert_activated(lb, row):
-                idx = row.get_index()
-                pid, sec = _alert_meta[idx]
-                self._win._open_project(pid, on_back=self._win.show_home, section=sec)
-
-            alert_lb.connect("row-activated", _alert_activated)
-            self.append(alert_lb)
-
         # ── Homepage tip ──────────────────────────────
         tb = tip_banner("homepage",
             "Click Overall progress to see all tasks and goals across every project. "
-            "The ● health dot turns yellow/red when goals or tasks need attention. "
+            "Project rows highlighted in red or yellow have overdue items. "
             "Press + on any project row to add a task without opening it.")
         if tb: self.append(tb)
 
@@ -3075,6 +3291,10 @@ class HomeView(Gtk.Box):
             health_dot.set_tooltip_text(health_reason)
             _HEALTH_CSS = {"green": "success", "yellow": "warning", "red": "error"}
             health_dot.add_css_class(_HEALTH_CSS.get(health_color, "dim-label"))
+            if health_color == "red":
+                row.add_css_class("error")
+            elif health_color == "yellow":
+                row.add_css_class("warning")
             row.add_prefix(health_dot)
             if total:
                 prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
