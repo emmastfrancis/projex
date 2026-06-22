@@ -41,6 +41,7 @@ APP_CSS = """
 }
 .overdue-project-row .title { color: #e01b24; }
 .proj-bold-row .title { font-weight: bold; }
+.priority-normal-lbl { color: #f5c211; }
 """
 
 COLOR_PALETTE = [
@@ -2647,7 +2648,8 @@ class GoalsView(Gtk.Box):
 
             pri_lbl = Gtk.Label(label=priority.upper())
             pri_lbl.add_css_class("caption")
-            pri_lbl.add_css_class({"high": "error", "low": "accent", "normal": "dim-label"}.get(priority, "dim-label"))
+            _pri_css = {"high": "error", "low": "accent", "normal": "priority-normal-lbl"}
+            pri_lbl.add_css_class(_pri_css.get(priority, "dim-label"))
             pri_lbl.set_valign(Gtk.Align.CENTER)
             pri_lbl.set_size_request(52, -1)
             pri_lbl.set_xalign(0.5)
@@ -2666,9 +2668,6 @@ class GoalsView(Gtk.Box):
                 pbar.set_size_request(60, -1)
                 pbar.set_valign(Gtk.Align.CENTER)
                 row.add_suffix(pbar)
-
-            row.set_activatable(True)
-            row.connect("activated", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
 
             # Quick-add task linked to this goal
             quick_btn = Gtk.Button(icon_name="list-add-symbolic")
@@ -3800,16 +3799,6 @@ class ProjectDetailView(Gtk.Box):
         export_btn.connect("clicked", self._do_export)
         hdr.pack_end(export_btn)
 
-        # Pomodoro toggle (controls the global timer in MainWindow)
-        pomo_hdr_btn = Gtk.Button(icon_name="clock-symbolic")
-        pomo_hdr_btn.add_css_class("flat")
-        pomo_hdr_btn.set_tooltip_text("Toggle Pomodoro timer")
-        def _toggle_pomo(_):
-            rev = self._win._pomo_rev
-            rev.set_reveal_child(not rev.get_reveal_child())
-        pomo_hdr_btn.connect("clicked", _toggle_pomo)
-        hdr.pack_end(pomo_hdr_btn)
-
         home_btn = Gtk.Button(icon_name="go-previous-symbolic")
         home_btn.add_css_class("flat")
         home_btn.set_tooltip_text("Back to overview")
@@ -4759,7 +4748,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._show_content_view(ComingUpView(self), "Upcoming Deadlines")
 
     def show_focus_mode(self):
-        self._show_content_view(FocusModeView(self), "Focus Mode")
+        if self._content_page.get_title() == "Focus Mode":
+            self.show_home()
+        else:
+            self._show_content_view(FocusModeView(self), "Focus Mode")
 
     def show_pinned_notes(self):
         self._show_content_view(AllPinnedNotesView(self), "Pinned Notes")
@@ -4911,6 +4903,8 @@ class App(Adw.Application):
 
 
 if __name__ == "__main__":
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("Projex")
     init_db()
     migrate_db()
     App().run()

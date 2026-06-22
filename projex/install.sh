@@ -56,7 +56,7 @@ Terminal=false
 Type=Application
 Categories=Office;ProjectManagement;GTK;
 Keywords=project;tasks;milestones;goals;tracker;
-StartupWMClass=projex
+StartupWMClass=io.github.emmastf.Projex
 EOF
 
 # Refresh desktop database
