@@ -622,7 +622,7 @@ def _generate_markdown(pid):
 
     lines = [f"# {p['name']}\n"]
     lines.append(f"**Status:** {p['status']}  |  **Progress:** {pct}% ({done_t}/{len(todos)} tasks)\n")
-    if p.get("description"):
+    if safe_col(p, "description"):
         lines.append(f"> {p['description']}\n")
     lines.append("")
 
@@ -1052,7 +1052,7 @@ class GanttChart(Gtk.Box):
 
         project_color = "#4fa8c4"
         if self._project:
-            project_color = self._project.get("color") or "#4fa8c4"
+            project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
         da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None))
@@ -1358,7 +1358,7 @@ class GoalEditDialog(Adw.Window):
             _all_goals = c.execute(
                 "SELECT id, text FROM goal WHERE project_id=? ORDER BY id", (pid,)
             ).fetchall()
-        _other = [g for g in _all_goals if not goal or g["id"] != goal.get("id")]
+        _other = [g for g in _all_goals if not goal or g["id"] != safe_col(goal, "id")]
         _dep_labels = ["— none —"] + [g["text"] for g in _other]
         _dep_ids    = [0] + [g["id"] for g in _other]
         dep_row = Adw.ActionRow(title="Depends on")
@@ -2517,8 +2517,8 @@ class NoteEditView(Gtk.Box):
                           margin_top=8, margin_bottom=8,
                           margin_start=12, margin_end=12)
 
-        pin_icon = "starred-symbolic" if (note and note.get("pinned")) else "non-starred-symbolic"
-        self._pin_btn = Gtk.ToggleButton(icon_name=pin_icon, active=bool(note and note.get("pinned")))
+        pin_icon = "starred-symbolic" if (note and safe_col(note, "pinned")) else "non-starred-symbolic"
+        self._pin_btn = Gtk.ToggleButton(icon_name=pin_icon, active=bool(note and safe_col(note, "pinned")))
         self._pin_btn.add_css_class("flat")
         self._pin_btn.set_tooltip_text("Pin to dashboard")
         toolbar.append(self._pin_btn)
@@ -2775,7 +2775,7 @@ class GlobalSearchView(Gtk.Box):
         for r in results:
             title = r["title"][:80].replace("\n", " ")
             escaped = GLib.markup_escape_text(title)
-            if r.get("is_done"):
+            if safe_col(r, "is_done"):
                 escaped = f"<s>{escaped}</s>"
             row = Adw.ActionRow(title=escaped, subtitle=f"{r['kind']}  ·  {r['project_name']}")
             row.set_use_markup(True)
@@ -3600,7 +3600,7 @@ class ProjectDetailView(Gtk.Box):
             tname = name_row.get_text().strip() or "Project template"
             with get_db() as c:
                 c.execute("INSERT INTO project_template (name, description, color, emoji) VALUES (?,?,?,?)",
-                          (tname, p.get("description","") if p else "",
+                          (tname, safe_col(p,"description") if p else "",
                            p["color"] if p else "#4fa8c4",
                            safe_col(p,"emoji") if p else ""))
                 tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
