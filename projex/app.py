@@ -11,7 +11,7 @@ import random
 from datetime import date, datetime, timedelta
 
 APP_ID = "io.github.emmastf.Projex"
-VERSION = "0.1.28"
+VERSION = "0.1.29"
 _CHANGELOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHANGELOG.md")
 _data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 _data_dir = os.path.join(_data_home, "projex")
@@ -358,6 +358,13 @@ def migrate_db():
             "ALTER TABLE project       ADD COLUMN group_id      INTEGER DEFAULT 0",
             "ALTER TABLE writing_entry ADD COLUMN content_format TEXT DEFAULT 'plain'",
             "ALTER TABLE todo          ADD COLUMN due_date       TEXT DEFAULT ''",
+            "ALTER TABLE goal ADD COLUMN start_date  TEXT    DEFAULT ''",
+            "ALTER TABLE goal ADD COLUMN end_date    TEXT    DEFAULT ''",
+            "ALTER TABLE goal ADD COLUMN status      TEXT    DEFAULT 'pending'",
+            "ALTER TABLE goal ADD COLUMN priority    TEXT    DEFAULT 'normal'",
+            "ALTER TABLE goal ADD COLUMN notes       TEXT    DEFAULT ''",
+            "ALTER TABLE goal ADD COLUMN blocked_by  INTEGER DEFAULT 0",
+            "ALTER TABLE todo ADD COLUMN goal_id     INTEGER DEFAULT NULL",
         ]:
             try:
                 c.execute(sql)
@@ -366,6 +373,27 @@ def migrate_db():
         # Populate NULLs left by previous migration runs
         c.execute("UPDATE milestone SET priority='normal' WHERE priority IS NULL")
         c.execute("UPDATE milestone SET status='pending'  WHERE status   IS NULL")
+
+    try:
+        with get_db() as c:
+            ms = c.execute("SELECT * FROM milestone").fetchall()
+            for m in ms:
+                exists = c.execute(
+                    "SELECT id FROM goal WHERE project_id=? AND text=?",
+                    (m["project_id"], m["title"])
+                ).fetchone()
+                if not exists:
+                    c.execute(
+                        "INSERT INTO goal (project_id,text,done,tags,due_date,start_date,end_date,status,priority,notes,blocked_by)"
+                        " VALUES (?,?,0,?,?,?,?,?,?,?,?)",
+                        (m["project_id"], m["title"],
+                         safe_col(m,"tags",""), safe_col(m,"end_date",""),
+                         safe_col(m,"start_date",""), safe_col(m,"end_date",""),
+                         safe_col(m,"status","pending"), safe_col(m,"priority","normal"),
+                         safe_col(m,"notes",""), int(safe_col(m,"blocked_by") or 0))
+                    )
+    except Exception:
+        pass
 
 
 def get_setting(key, default=""):
@@ -385,10 +413,6 @@ def db_projects():
 def db_project(pid):
     with get_db() as c:
         return c.execute("SELECT * FROM project WHERE id=?", (pid,)).fetchone()
-
-def db_milestones(pid):
-    with get_db() as c:
-        return c.execute("SELECT * FROM milestone WHERE project_id=? ORDER BY start_date", (pid,)).fetchall()
 
 def db_todos(pid):
     with get_db() as c:
@@ -424,7 +448,22 @@ def db_pt_items(tid):
 
 def db_goals(pid):
     with get_db() as c:
-        return c.execute("SELECT * FROM goal WHERE project_id=? ORDER BY done, id", (pid,)).fetchall()
+        return c.execute(
+            "SELECT * FROM goal WHERE project_id=? "
+            "ORDER BY CASE WHEN end_date='' THEN '9999-99-99' ELSE end_date END ASC, id ASC",
+            (pid,)
+        ).fetchall()
+
+
+def db_all_goals_with_project():
+    with get_db() as c:
+        return c.execute(
+            "SELECT g.*, p.name AS project_name, p.color AS project_color, p.id AS project_id "
+            "FROM goal g JOIN project p ON g.project_id = p.id "
+            "WHERE g.start_date != '' AND g.end_date != '' AND g.done = 0 "
+            "AND p.status != 'archived' "
+            "ORDER BY g.end_date"
+        ).fetchall()
 
 def db_goal_todos(goal_id):
     with get_db() as c:
@@ -449,10 +488,6 @@ def db_set_project_group(pid, gid):
     with get_db() as c:
         c.execute("UPDATE project SET group_id=? WHERE id=?", (gid, pid))
 
-def db_entries(pid):
-    with get_db() as c:
-        return c.execute("SELECT * FROM writing_entry WHERE project_id=? ORDER BY date DESC, id DESC", (pid,)).fetchall()
-
 def db_notes(pid):
     with get_db() as c:
         return c.execute("SELECT * FROM note WHERE project_id=? ORDER BY pinned DESC, id DESC", (pid,)).fetchall()
@@ -462,66 +497,18 @@ def db_files(pid):
         return c.execute("SELECT * FROM file WHERE project_id=? ORDER BY added_date DESC", (pid,)).fetchall()
 
 
-def db_all_milestones_with_project():
-    """All milestones from all projects, joined with project name and color."""
-    with get_db() as c:
-        return c.execute(
-            "SELECT m.*, p.name AS project_name, p.color AS project_color "
-            "FROM milestone m JOIN project p ON m.project_id = p.id "
-            "ORDER BY m.start_date"
-        ).fetchall()
-
-
-def db_due_soon(days=14):
-    """Milestones whose end_date is within `days` days, not yet done."""
-    today  = date.today().isoformat()
-    cutoff = (date.today() + timedelta(days=days)).isoformat()
-    with get_db() as c:
-        return c.execute(
-            "SELECT m.*, p.name AS project_name, p.color AS project_color "
-            "FROM milestone m JOIN project p ON m.project_id = p.id "
-            "WHERE m.end_date >= ? AND m.end_date <= ? AND COALESCE(m.status,'') != 'done' "
-            "ORDER BY m.end_date",
-            (today, cutoff),
-        ).fetchall()
-
-
-def db_goals_due_soon(days=14):
-    """Goals with a due_date within `days` days, not yet done."""
-    today  = date.today().isoformat()
-    cutoff = (date.today() + timedelta(days=days)).isoformat()
-    with get_db() as c:
-        return c.execute(
-            "SELECT g.*, p.name AS project_name, p.color AS project_color "
-            "FROM goal g JOIN project p ON g.project_id = p.id "
-            "WHERE g.due_date >= ? AND g.due_date <= ? AND g.done = 0 "
-            "ORDER BY g.due_date",
-            (today, cutoff),
-        ).fetchall()
-
-
 def db_coming_up(days=90):
-    """All milestones + goals + tasks due in the next N days, sorted by date."""
     today  = date.today().isoformat()
     cutoff = (date.today() + timedelta(days=days)).isoformat()
     items = []
     with get_db() as c:
-        ms = c.execute(
-            "SELECT m.id, m.title, m.end_date, m.status AS item_status, "
-            "m.priority, 'Milestone' AS kind, "
-            "p.name AS project_name, p.color AS project_color, p.id AS project_id "
-            "FROM milestone m JOIN project p ON m.project_id = p.id "
-            "WHERE m.end_date >= ? AND m.end_date <= ? AND COALESCE(m.status,'') != 'done' "
-            "ORDER BY m.end_date",
-            (today, cutoff),
-        ).fetchall()
         gs = c.execute(
-            "SELECT g.id, g.text AS title, g.due_date AS end_date, "
-            "'' AS item_status, 'normal' AS priority, 'Goal' AS kind, "
+            "SELECT g.id, g.text AS title, g.end_date, "
+            "g.status AS item_status, g.priority, 'Goal' AS kind, "
             "p.name AS project_name, p.color AS project_color, p.id AS project_id "
             "FROM goal g JOIN project p ON g.project_id = p.id "
-            "WHERE g.due_date >= ? AND g.due_date <= ? AND g.done = 0 "
-            "ORDER BY g.due_date",
+            "WHERE g.end_date >= ? AND g.end_date <= ? AND g.done = 0 AND g.end_date != '' "
+            "ORDER BY g.end_date",
             (today, cutoff),
         ).fetchall()
         ts = c.execute(
@@ -533,7 +520,6 @@ def db_coming_up(days=90):
             "ORDER BY t.due_date",
             (today, cutoff),
         ).fetchall()
-    for row in ms: items.append({k: row[k] for k in row.keys()})
     for row in gs: items.append({k: row[k] for k in row.keys()})
     for row in ts: items.append({k: row[k] for k in row.keys()})
     items.sort(key=lambda x: x["end_date"] or "")
@@ -550,7 +536,7 @@ def db_all_files_with_project():
 
 
 def db_search(query):
-    """Full-text search across todos, milestones, goals, notes, entries."""
+    """Full-text search across todos, goals, notes, files."""
     q = f"%{query.lower()}%"
     results = []
     with get_db() as c:
@@ -562,30 +548,14 @@ def db_search(query):
             (q, q),
         ).fetchall()
         results += [{k: r[k] for k in r.keys()} for r in rows]
-        rows = c.execute(
-            "SELECT 'Milestone' AS kind, m.title, 0 AS is_done, "
-            "p.name AS project_name, p.id AS project_id "
-            "FROM milestone m JOIN project p ON m.project_id = p.id "
-            "WHERE lower(m.title) LIKE ? OR lower(COALESCE(m.notes,'')) LIKE ?",
-            (q, q),
-        ).fetchall()
-        results += [{k: r[k] for k in r.keys()} for r in rows]
-        rows = c.execute(
+        goals = c.execute(
             "SELECT 'Goal' AS kind, g.text AS title, g.done AS is_done, "
             "p.name AS project_name, p.id AS project_id "
-            "FROM goal g JOIN project p ON g.project_id = p.id "
-            "WHERE lower(g.text) LIKE ?",
-            (q,),
+            "FROM goal g JOIN project p ON g.project_id=p.id "
+            "WHERE g.text LIKE ? OR g.notes LIKE ?",
+            (q, q)
         ).fetchall()
-        results += [{k: r[k] for k in r.keys()} for r in rows]
-        rows = c.execute(
-            "SELECT 'Entry' AS kind, e.title, (e.status='done') AS is_done, "
-            "p.name AS project_name, p.id AS project_id "
-            "FROM writing_entry e JOIN project p ON e.project_id = p.id "
-            "WHERE lower(e.title) LIKE ? OR lower(COALESCE(e.content,'')) LIKE ?",
-            (q, q),
-        ).fetchall()
-        results += [{k: r[k] for k in r.keys()} for r in rows]
+        results += [{k: r[k] for k in r.keys()} for r in goals]
         rows = c.execute(
             "SELECT 'Note' AS kind, n.content AS title, 0 AS is_done, "
             "p.name AS project_name, p.id AS project_id "
@@ -605,90 +575,38 @@ def db_search(query):
     return results[:60]
 
 
-def sync_milestone_auto_tags(pid):
-    """Recompute milestone completion % for any milestone linked to a task label."""
-    with get_db() as c:
-        milestones = c.execute(
-            "SELECT id, auto_tag FROM milestone "
-            "WHERE project_id=? AND auto_tag IS NOT NULL AND auto_tag != ''",
-            (pid,),
-        ).fetchall()
-        if not milestones:
-            return
-        todos = c.execute(
-            "SELECT done, tags FROM todo WHERE project_id=?", (pid,)
-        ).fetchall()
-        for ms in milestones:
-            tag = (ms["auto_tag"] or "").strip()
-            if not tag:
-                continue
-            matching = [t for t in todos if tag in (t["tags"] or "")]
-            if not matching:
-                continue
-            done_ct = sum(1 for t in matching if t["done"])
-            pct = round(done_ct / len(matching) * 100)
-            c.execute("UPDATE milestone SET completion=? WHERE id=?", (pct, ms["id"]))
-
-
-def compute_streak(pid):
-    """Return how many consecutive calendar days (back from today) had a completed task."""
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT DISTINCT completed_date FROM todo "
-            "WHERE project_id=? AND done=1 AND completed_date != '' AND completed_date IS NOT NULL",
-            (pid,),
-        ).fetchall()
-    date_strs = sorted({r[0] for r in rows if r[0]}, reverse=True)
-    if not date_strs:
-        return 0
-    today_s     = date.today().isoformat()
-    yesterday_s = (date.today() - timedelta(days=1)).isoformat()
-    if date_strs[0] not in (today_s, yesterday_s):
-        return 0
-    streak   = 0
-    expected = date.today()
-    for ds in date_strs:
-        d = datetime.strptime(ds, "%Y-%m-%d").date()
-        if d == expected:
-            streak  += 1
-            expected -= timedelta(days=1)
-        elif d < expected:
-            break
-    return streak
-
-
 def project_health(pid):
     """Return ('green'|'yellow'|'red', reason_string) for a project."""
     today = date.today()
-    ms    = db_milestones(pid)
+    goals = db_goals(pid)
     todos = db_todos(pid)
 
-    overdue = []
-    for m in ms:
-        if safe_col(m, "status") in ("done",):
+    overdue_goals = []
+    for g in goals:
+        if g["done"] or safe_col(g, "status") == "done":
             continue
-        try:
-            end = datetime.strptime(m["end_date"], "%Y-%m-%d").date()
-            if end < today:
-                overdue.append(m["title"])
-        except (ValueError, TypeError):
-            pass
-
-    undone  = [t for t in todos if not t["done"]]
-    done_ct = sum(1 for t in todos if t["done"])
-    pct     = done_ct / len(todos) if todos else 1.0
-    streak  = compute_streak(pid)
+        end = safe_col(g, "end_date")
+        if end:
+            try:
+                if datetime.strptime(end, "%Y-%m-%d").date() < today:
+                    overdue_goals.append(g["text"])
+            except ValueError:
+                pass
 
     overdue_tasks = [t for t in todos if not t["done"] and safe_col(t, "due_date")
                      and safe_col(t, "due_date") < today.isoformat()]
 
-    if overdue:
-        return "red", f"{len(overdue)} overdue milestone{'s' if len(overdue)>1 else ''}"
+    undone = [t for t in todos if not t["done"]]
+    done_ct = sum(1 for t in todos if t["done"])
+    pct = done_ct / len(todos) if todos else 1.0
+
+    if overdue_goals:
+        return "red", f"{len(overdue_goals)} overdue goal{'s' if len(overdue_goals)>1 else ''}"
     if overdue_tasks:
         return "red", f"{len(overdue_tasks)} overdue task{'s' if len(overdue_tasks)>1 else ''}"
     if undone and pct < 0.1 and len(todos) > 3:
         return "yellow", "Getting started"
-    if streak == 0 and undone:
+    if undone:
         return "yellow", "No recent activity"
     return "green", "On track"
 
@@ -698,8 +616,6 @@ def _generate_markdown(pid):
     p       = db_project(pid)
     todos   = db_todos(pid)
     goals   = db_goals(pid)
-    ms      = db_milestones(pid)
-    entries = db_entries(pid)[:5]
 
     done_t = sum(1 for t in todos if t["done"])
     pct    = int(done_t / len(todos) * 100) if todos else 0
@@ -709,16 +625,6 @@ def _generate_markdown(pid):
     if p.get("description"):
         lines.append(f"> {p['description']}\n")
     lines.append("")
-
-    if ms:
-        lines.append("## Milestones\n")
-        for m in ms:
-            status = safe_col(m, "status") or "pending"
-            check  = "x" if status == "done" else " "
-            comp   = safe_col(m, "completion") or 0
-            comp_s = f" {comp}%" if comp else ""
-            lines.append(f"- [{check}] **{m['title']}** ({m['start_date']} → {m['end_date']}{comp_s}) — *{status}*")
-        lines.append("")
 
     undone_t = [t for t in todos if not t["done"]]
     if undone_t:
@@ -736,26 +642,13 @@ def _generate_markdown(pid):
             lines.append(f"- [x] {t['text']}")
         lines.append("")
 
-    undone_g = [g for g in goals if not g["done"]]
-    if undone_g:
-        lines.append("## Goals\n")
-        for g in undone_g:
-            due = safe_col(g, "due_date")
-            due_s = f" *(due {due})*" if due else ""
-            lines.append(f"- [ ] {g['text']}{due_s}")
-        lines.append("")
-
-    if entries:
-        lines.append(f"## Writing Log *(recent {len(entries)})*\n")
-        for e in entries:
-            wc = len((e["content"] or "").split()) if e.get("content") else 0
-            lines.append(f"### {e['title']} — {e['date']} *({e['status']}, {wc} words)*\n")
-            if e.get("content"):
-                preview = e["content"][:500]
-                lines.append(preview)
-                if len(e["content"]) > 500:
-                    lines.append("\n*[…truncated]*")
-            lines.append("")
+    if goals:
+        lines.append("\n## Goals\n")
+        for g in goals:
+            status = safe_col(g, "status") or ("done" if g["done"] else "pending")
+            end = safe_col(g, "end_date")
+            lines.append(f"- {'✓' if g['done'] else '○'} **{g['text']}**" +
+                         (f" (due {end})" if end else "") + f" [{status}]")
 
     return "\n".join(lines)
 
@@ -779,10 +672,6 @@ def all_tagged_items(pid):
              lambda r: bool(r["done"]))
     _collect(db_goals(pid),      "Goal",      lambda r: r["text"],
              lambda r: bool(r["done"]))
-    _collect(db_milestones(pid), "Milestone", lambda r: r["title"],
-             lambda r: safe_col(r, "status") == "done")
-    _collect(db_entries(pid),    "Entry",     lambda r: r["title"],
-             lambda r: r["status"] == "done")
     _collect(db_notes(pid),      "Note",
              lambda r: r["content"][:60].replace("\n", " "),
              lambda r: False)
@@ -814,88 +703,6 @@ def rgba_to_hex(rgba):
     return "#{:02x}{:02x}{:02x}".format(
         int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255)
     )
-
-
-def make_heatmap(weeks=26):
-    """Return a DrawingArea showing a GitHub-style completion heatmap for the past N weeks."""
-    CELL = 12; GAP = 3; STEP = CELL + GAP
-    DAYS = weeks * 7
-    today = date.today()
-    # Collect completed-task counts per day
-    day_counts = {}
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT completed_date, COUNT(*) as n FROM todo "
-            "WHERE done=1 AND completed_date >= ? AND completed_date <= ? "
-            "GROUP BY completed_date",
-            ((today - timedelta(days=DAYS)).isoformat(), today.isoformat()),
-        ).fetchall()
-    for r in rows:
-        day_counts[r["completed_date"]] = r["n"]
-    max_count = max(day_counts.values(), default=1) or 1
-
-    # Layout: columns = weeks (left→right), rows = days of week (Mon top)
-    DOW_W = 26   # label column width
-    HDR_H = 18   # month label row height
-    cols = weeks
-    chart_w = DOW_W + cols * STEP
-    chart_h = HDR_H + 7 * STEP
-
-    da = Gtk.DrawingArea()
-    da.set_content_width(chart_w)
-    da.set_content_height(chart_h)
-    da.set_hexpand(True)
-    da.set_can_target(False)
-
-    def _draw(area, cr, w, h):
-        # Background
-        cr.set_source_rgba(0.10, 0.12, 0.17, 1.0)
-        cr.rectangle(0, 0, w, h); cr.fill()
-        cr.select_font_face("Sans", 0, 0); cr.set_font_size(9)
-
-        # Day-of-week labels
-        for dow, lbl in [(0, "Mon"), (2, "Wed"), (4, "Fri")]:
-            cr.set_source_rgba(0.6, 0.65, 0.75, 0.7)
-            cr.move_to(2, HDR_H + dow * STEP + CELL - 2)
-            cr.show_text(lbl)
-
-        # Month labels (show when month changes between columns)
-        prev_month = None
-        for col in range(cols):
-            col_date = today - timedelta(days=(cols - 1 - col) * 7)
-            # align to Monday of that week
-            col_date -= timedelta(days=col_date.weekday())
-            if col_date.month != prev_month:
-                cx = DOW_W + col * STEP
-                cr.set_source_rgba(0.7, 0.75, 0.85, 0.9)
-                cr.move_to(cx, 12)
-                cr.show_text(col_date.strftime("%b"))
-                prev_month = col_date.month
-
-        # Cells
-        for col in range(cols):
-            # week starting Monday
-            week_mon = today - timedelta(days=(cols - 1 - col) * 7)
-            week_mon -= timedelta(days=week_mon.weekday())
-            for dow in range(7):
-                d = week_mon + timedelta(days=dow)
-                if d > today:
-                    continue
-                ds = d.isoformat()
-                cnt = day_counts.get(ds, 0)
-                intensity = cnt / max_count if cnt else 0
-                if intensity == 0:
-                    cr.set_source_rgba(0.20, 0.23, 0.30, 1.0)
-                else:
-                    # green gradient
-                    g = 0.35 + 0.55 * intensity
-                    cr.set_source_rgba(0.10, g, 0.28 + 0.12 * intensity, 0.95)
-                cx = DOW_W + col * STEP
-                cy = HDR_H + dow * STEP
-                cr.rectangle(cx, cy, CELL, CELL); cr.fill()
-
-    da.set_draw_func(_draw)
-    return da
 
 
 def tip_banner(key, text):
@@ -963,52 +770,48 @@ def section_page(title, content_widget, extra_header_widgets=None):
 # Gantt chart
 # ══════════════════════════════════════════════════════
 
-class GanttChart(Gtk.DrawingArea):
-    def __init__(self, milestones, accent_hex, view_start=None, view_end=None):
+class _GanttDrawArea(Gtk.DrawingArea):
+    """Internal drawing widget for the Gantt chart."""
+
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False):
         super().__init__()
-        self._ms = milestones
-        self._accent = parse_rgba(accent_hex)
-        self._view_start = view_start  # datetime or None → auto-compute
-        self._view_end   = view_end
-        self.set_content_height(max(80, len(milestones) * 36 + 48))
+        self._items = items
+        self._accent = accent
+        self._view_start = view_start
+        self._view_end = view_end
+        self._show_project_label = show_project_label
+        self.set_content_height(max(80, len(items) * 36 + 48))
         self.set_hexpand(True)
         self.set_can_target(False)
         self.set_draw_func(self._draw)
 
-    def _get_bar_rgba(self, m):
-        """Per-milestone bar colour. Dict milestones with '_project_color' override status-based colour."""
-        if isinstance(m, dict) and m.get("_project_color"):
-            c = parse_rgba(m["_project_color"])
-            return (c.red, c.green, c.blue, 0.88)
-        return self._bar_color(safe_col(m, "status") or "")
-
-    def _bar_color(self, status):
-        # Each status has a visually distinct solid color
-        if status == "done":
+    def _bar_color(self, item):
+        status = safe_col(item, "status") or ""
+        done = bool(item.get("done"))
+        if done or status == "done":
             return (0.15, 0.63, 0.41, 0.92)   # green
         if status == "blocked":
             return (0.88, 0.11, 0.14, 0.92)   # red
-        if status == "pending":
-            return (0.42, 0.46, 0.54, 0.85)   # neutral blue-gray (never confused with accent)
-        # "active" or any unrecognised value → project accent at full opacity
-        return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
+        if status == "active":
+            return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
+        # pending or unknown → dim blue-gray
+        return (0.42, 0.46, 0.54, 0.85)
 
     def _draw(self, area, cr, width, height):
-        ms = self._ms
-        if not ms:
+        items = self._items
+        if not items:
             return
         ROW_H, PAD, LABEL_W, HDR_H = 36, 10, 170, 28
 
-        # Determine range
         if self._view_start and self._view_end:
             min_d, max_d = self._view_start, self._view_end
         else:
             dates = []
-            for m in ms:
+            for it in items:
                 try:
-                    dates.append(datetime.strptime(m["start_date"], "%Y-%m-%d"))
-                    dates.append(datetime.strptime(m["end_date"], "%Y-%m-%d"))
-                except ValueError:
+                    dates.append(datetime.strptime(it["start_date"], "%Y-%m-%d"))
+                    dates.append(datetime.strptime(it["end_date"], "%Y-%m-%d"))
+                except (ValueError, KeyError):
                     pass
             if not dates:
                 return
@@ -1027,9 +830,8 @@ class GanttChart(Gtk.DrawingArea):
         cr.rectangle(0, 0, width, height)
         cr.fill()
 
-        # Time grid lines + labels
         cr.select_font_face("Sans", 0, 0)
-        use_months = total_days <= 800  # ≤~2.2 years → show months
+        use_months = total_days <= 800
 
         if use_months:
             cur = datetime(min_d.year, min_d.month, 1)
@@ -1044,7 +846,6 @@ class GanttChart(Gtk.DrawingArea):
                 cr.show_text(cur.strftime("%Y" if is_jan else "%b"))
                 cur = datetime(cur.year + (cur.month == 12), (cur.month % 12) + 1, 1)
         else:
-            # Quarter lines for multi-year ranges
             for yr in range(min_d.year, max_d.year + 1):
                 for qm, qlbl in [(1, str(yr)), (4, "Q2"), (7, "Q3"), (10, "Q4")]:
                     try:
@@ -1062,46 +863,44 @@ class GanttChart(Gtk.DrawingArea):
                     cr.move_to(x + 3, 18)
                     cr.show_text(qlbl)
 
-        # "Today" marker
+        # Today marker
         today_dt = datetime.combine(date.today(), datetime.min.time())
         if min_d <= today_dt <= max_d:
             tx = x_of(today_dt)
-            cr.set_source_rgba(0.93, 0.34, 0.20, 0.90)   # tomato/red
+            cr.set_source_rgba(0.93, 0.34, 0.20, 0.90)
             cr.set_line_width(1.5)
             cr.move_to(tx, 0); cr.line_to(tx, height); cr.stroke()
             cr.set_font_size(9)
             cr.move_to(tx + 3, 10); cr.show_text("today")
 
-        # Milestone bars
-        bar_pos = {}   # ms_id → (x_start, x_end, y_mid) for dependency arrows
-        for i, m in enumerate(ms):
+        bar_pos = {}
+        for i, item in enumerate(items):
             y = HDR_H + i * ROW_H
             if i % 2 == 0:
                 cr.set_source_rgba(1, 1, 1, 0.025)
                 cr.rectangle(0, y, width, ROW_H); cr.fill()
 
-            # Project colour strip (left edge, home Gantt only)
             strip_w = 0
-            if isinstance(m, dict) and m.get("_project_color"):
-                pc = parse_rgba(m["_project_color"])
+            if self._show_project_label and item.get("_project_color"):
+                pc = parse_rgba(item["_project_color"])
                 cr.set_source_rgba(pc.red, pc.green, pc.blue, 0.88)
                 cr.rectangle(2, y + 5, 5, ROW_H - 10)
                 cr.fill()
                 strip_w = 9
 
-            label = m["title"][:22] + "…" if len(m["title"]) > 22 else m["title"]
+            label_text = item.get("text") or item.get("title") or ""
+            label = label_text[:22] + "…" if len(label_text) > 22 else label_text
             cr.set_font_size(12)
             cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
             cr.move_to(strip_w + 4, y + ROW_H / 2 + 4)
             cr.show_text(label)
 
             try:
-                d1 = datetime.strptime(m["start_date"], "%Y-%m-%d")
-                d2 = datetime.strptime(m["end_date"], "%Y-%m-%d")
-            except ValueError:
+                d1 = datetime.strptime(item["start_date"], "%Y-%m-%d")
+                d2 = datetime.strptime(item["end_date"], "%Y-%m-%d")
+            except (ValueError, KeyError):
                 continue
 
-            # Clip bar to view range
             d1c = max(d1, min_d)
             d2c = min(d2, max_d)
             if d1c > d2c:
@@ -1112,12 +911,11 @@ class GanttChart(Gtk.DrawingArea):
             bx, by, bh, r = x1, y + 7, ROW_H - 14, 4.0
 
             mid = y + ROW_H / 2
-            ms_id = m.get("id") if isinstance(m, dict) else (m["id"] if "id" in m.keys() else None)
-            if ms_id:
-                bar_pos[ms_id] = (x_of(d1), x_of(d2), mid)
+            item_id = item.get("id")
+            if item_id:
+                bar_pos[item_id] = (x_of(d1), x_of(d2), mid)
 
-            bar_rgba   = self._get_bar_rgba(m)
-            completion = int(safe_col(m, "completion") or 0)
+            bar_rgba = self._bar_color(item)
 
             def _rounded_rect(cx, cy, cw, ch, cr_r):
                 cr.move_to(cx + cr_r, cy)
@@ -1131,43 +929,23 @@ class GanttChart(Gtk.DrawingArea):
                 cr.arc(cx + cr_r, cy + cr_r, cr_r, math.pi, 3 * math.pi / 2)
                 cr.close_path()
 
-            if 0 < completion < 100:
-                # Background: dimmed full bar
-                rr, rg, rb, ra = bar_rgba
-                cr.set_source_rgba(rr, rg, rb, ra * 0.28)
-                _rounded_rect(bx, by, bw, bh, r)
-                cr.fill()
-                # Foreground: filled portion
-                filled_w = max(r * 2, bw * completion / 100)
-                cr.set_source_rgba(*bar_rgba)
-                _rounded_rect(bx, by, filled_w, bh, r)
-                cr.fill()
-                # % label inside bar
-                cr.set_source_rgba(1, 1, 1, 0.75)
-                cr.set_font_size(9)
-                lbl = f"{completion}%"
-                ext = cr.text_extents(lbl)
-                if filled_w > ext.width + 8:
-                    cr.move_to(bx + filled_w / 2 - ext.width / 2, by + bh / 2 + 3)
-                    cr.show_text(lbl)
-            else:
-                cr.set_source_rgba(*bar_rgba)
-                _rounded_rect(bx, by, bw, bh, r)
-                cr.fill()
+            cr.set_source_rgba(*bar_rgba)
+            _rounded_rect(bx, by, bw, bh, r)
+            cr.fill()
 
-            # Priority outline stroke
-            priority = safe_col(m, "priority") or "normal"
+            priority = safe_col(item, "priority") or "normal"
             _prio_stroke = {
                 "high":   (0.88, 0.11, 0.14, 0.90),
                 "low":    (0.21, 0.52, 0.89, 0.90),
-                "normal": (0.95, 0.80, 0.05, 0.80),
+                "normal": (0.95, 0.80, 0.05, 0.00),  # transparent for normal
             }
-            cr.set_source_rgba(*_prio_stroke[priority])
-            cr.set_line_width(1.5)
-            _rounded_rect(bx, by, bw, bh, r)
-            cr.stroke()
+            stroke_rgba = _prio_stroke.get(priority, (0, 0, 0, 0))
+            if stroke_rgba[3] > 0:
+                cr.set_source_rgba(*stroke_rgba)
+                cr.set_line_width(1.5)
+                _rounded_rect(bx, by, bw, bh, r)
+                cr.stroke()
 
-            # Arrow indicators when bar extends beyond view range
             if d1 < min_d or d2 > max_d:
                 cr.set_source_rgba(1, 1, 1, 0.55)
                 cr.set_font_size(9)
@@ -1176,18 +954,17 @@ class GanttChart(Gtk.DrawingArea):
                 if d2 > max_d:
                     cr.move_to(bx + bw - 10, by + bh - 2); cr.show_text("▶")
 
-        # ── Dependency arrows ─────────────────────────────────
+        # Dependency arrows
         cr.set_line_width(1.5)
-        for m in ms:
-            dep_id = int(safe_col(m, "blocked_by") or 0)
-            ms_id  = m.get("id") if isinstance(m, dict) else (m["id"] if "id" in m.keys() else None)
-            if not dep_id or dep_id not in bar_pos or not ms_id or ms_id not in bar_pos:
+        for item in items:
+            dep_id = int(safe_col(item, "blocked_by") or 0)
+            item_id = item.get("id")
+            if not dep_id or dep_id not in bar_pos or not item_id or item_id not in bar_pos:
                 continue
             px1, px2, py_mid = bar_pos[dep_id]
-            cx1, cx2, cy_mid = bar_pos[ms_id]
-            x0, y0 = px2, py_mid   # arrow tail: predecessor bar end
-            x3, y3 = cx1, cy_mid   # arrow head: dependent bar start
-            # Bezier control points
+            cx1, cx2, cy_mid = bar_pos[item_id]
+            x0, y0 = px2, py_mid
+            x3, y3 = cx1, cy_mid
             spread = max(30.0, abs(x3 - x0) * 0.45)
             cp1x, cp1y = x0 + spread, y0
             cp2x, cp2y = x3 - spread, y3
@@ -1195,13 +972,101 @@ class GanttChart(Gtk.DrawingArea):
             cr.move_to(x0, y0)
             cr.curve_to(cp1x, cp1y, cp2x, cp2y, x3, y3)
             cr.stroke()
-            # Arrowhead triangle at (x3, y3)
             cr.set_source_rgba(0.95, 0.75, 0.20, 0.85)
             cr.move_to(x3, y3)
             cr.line_to(x3 - 7, y3 - 4)
             cr.line_to(x3 - 7, y3 + 4)
             cr.close_path()
             cr.fill()
+
+
+class GanttChart(Gtk.Box):
+    """Gantt chart widget showing goals for a project (or all projects if pid=None)."""
+
+    def __init__(self, pid, project, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._pid = pid
+        self._project = project
+        self._win = win
+
+        today = date.today()
+        self._year_opts = (
+            ["All", "3 months", "6 months"] +
+            [str(y) for y in range(today.year - 1, today.year + 9)]
+        )
+        self._year_drop = Gtk.DropDown.new_from_strings(self._year_opts)
+        self._year_drop.set_selected(4)  # default: current year
+        self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild))
+
+        hdr = Gtk.Box(spacing=10, margin_bottom=2)
+        hdr.append(Gtk.Label(label="View:"))
+        hdr.append(self._year_drop)
+        self.append(hdr)
+
+        self._chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.append(self._chart_box)
+        self._rebuild()
+
+    def _view_range(self):
+        opt = self._year_opts[self._year_drop.get_selected()]
+        if opt == "All":
+            return None, None
+        today = date.today()
+        start = datetime(today.year, today.month, today.day)
+        if opt == "3 months":
+            return start, _months_later(start, 3)
+        if opt == "6 months":
+            return start, _months_later(start, 6)
+        y = int(opt)
+        return datetime(y, 1, 1), datetime(y, 12, 31)
+
+    def _rebuild(self):
+        clear_box(self._chart_box)
+        if self._pid is None:
+            goals = db_all_goals_with_project()
+            # convert Row to dict and map project_color
+            items = []
+            for g in goals:
+                d = {k: g[k] for k in g.keys()}
+                d["_project_color"] = d.get("project_color") or ""
+                items.append(d)
+        else:
+            raw_goals = db_goals(self._pid)
+            project_color = self._project["color"] if self._project else "#4fa8c4"
+            items = []
+            for g in raw_goals:
+                if not safe_col(g, "start_date") or not safe_col(g, "end_date"):
+                    continue
+                d = {k: g[k] for k in g.keys()}
+                d["_project_color"] = ""
+                items.append(d)
+
+        vstart, vend = self._view_range()
+        if vstart:
+            items = [it for it in items if self._in_range(it, vstart, vend)]
+
+        if not items:
+            lbl = Gtk.Label(label="No goals with dates in this period")
+            lbl.add_css_class("dim-label")
+            lbl.set_margin_top(8)
+            self._chart_box.append(lbl)
+            return
+
+        project_color = "#4fa8c4"
+        if self._project:
+            project_color = self._project.get("color") or "#4fa8c4"
+        accent = parse_rgba(project_color)
+
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None))
+        self._chart_box.append(da)
+
+    def _in_range(self, item, vstart, vend):
+        try:
+            s = datetime.strptime(item["start_date"], "%Y-%m-%d")
+            e = datetime.strptime(item["end_date"], "%Y-%m-%d")
+            return e >= vstart and s <= vend
+        except (ValueError, KeyError):
+            return False
 
 
 # ══════════════════════════════════════════════════════
@@ -1365,300 +1230,6 @@ class ProjectDialog(Adw.Window):
         self.close()
 
 
-class MilestoneDialog(Adw.Window):
-    def __init__(self, parent, pid, milestone=None, on_save=None):
-        super().__init__(
-            title="Edit Milestone" if milestone else "Add Milestone",
-            modal=True, transient_for=parent,
-            default_width=460, default_height=700, resizable=True,
-        )
-        self._pid = pid; self._ms = milestone; self._on_save = on_save
-        self._cal_target = "start"  # which date field the calendar controls
-        self._guard = False          # prevent feedback loops
-
-        tv = Adw.ToolbarView()
-        tv.add_top_bar(Adw.HeaderBar())
-
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-
-        # ── Fields ────────────────────────────────────────────
-        fields = Adw.PreferencesGroup()
-
-        self._title_row = Adw.EntryRow(title="Title")
-        if milestone: self._title_row.set_text(milestone["title"])
-        fields.add(self._title_row)
-
-        self._notes_row = Adw.EntryRow(title="Notes")
-        self._notes_row.set_text(safe_col(milestone, "notes") if milestone else "")
-        fields.add(self._notes_row)
-
-        self._tags_row = Adw.EntryRow(title="Labels")
-        self._tags_row.set_text(safe_col(milestone, "tags") if milestone else "")
-        fields.add(self._tags_row)
-
-        self._auto_tag_row = Adw.EntryRow(title="Auto-sync from label")
-        self._auto_tag_row.set_text(safe_col(milestone, "auto_tag") if milestone else "")
-        self._auto_tag_row.set_tooltip_text(
-            "Enter a task label (e.g. #design) — completion % auto-updates from matching tasks")
-        fields.add(self._auto_tag_row)
-
-        pri_row = Adw.ActionRow(title="Priority")
-        self._pri = Gtk.DropDown.new_from_strings(PRIORITIES)
-        self._pri.set_valign(Gtk.Align.CENTER)
-        cur_pri = safe_col(milestone, "priority") if milestone else "normal"
-        self._pri.set_selected(PRIORITIES.index(cur_pri) if cur_pri in PRIORITIES else 0)
-        pri_row.add_suffix(self._pri)
-        fields.add(pri_row)
-
-        st_row = Adw.ActionRow(title="Status")
-        self._mst = Gtk.DropDown.new_from_strings(MSTATUSES)
-        self._mst.set_valign(Gtk.Align.CENTER)
-        cur_st = safe_col(milestone, "status") if milestone else "pending"
-        self._mst.set_selected(MSTATUSES.index(cur_st) if cur_st in MSTATUSES else 0)
-        st_row.add_suffix(self._mst)
-        fields.add(st_row)
-
-        comp_row = Adw.ActionRow(title="Completion")
-        comp_row.set_subtitle("Percentage complete (shown as partial fill on Gantt)")
-        comp_box = Gtk.Box(spacing=6)
-        self._comp_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
-        self._comp_scale.set_hexpand(True)
-        self._comp_scale.set_draw_value(True)
-        self._comp_scale.set_value_pos(Gtk.PositionType.RIGHT)
-        self._comp_scale.set_size_request(180, -1)
-        cur_comp = int(safe_col(milestone, "completion") or 0) if milestone else 0
-        self._comp_scale.set_value(cur_comp)
-        comp_box.append(self._comp_scale)
-        comp_row.add_suffix(comp_box)
-        fields.add(comp_row)
-
-        # "Depends on" (blocked_by) — dropdown of other milestones in this project
-        dep_row = Adw.ActionRow(title="Depends on",
-                                subtitle="Draw a dependency arrow on the Gantt chart")
-        with get_db() as c:
-            _all_ms = c.execute(
-                "SELECT id, title FROM milestone WHERE project_id=? ORDER BY start_date",
-                (pid,),
-            ).fetchall()
-        _other_ms = [m for m in _all_ms if not milestone or m["id"] != milestone.get("id")]
-        _dep_labels = ["— none —"] + [m["title"] for m in _other_ms]
-        _dep_ids    = [0] + [m["id"] for m in _other_ms]
-        self._dep_drop = Gtk.DropDown.new_from_strings(_dep_labels)
-        self._dep_drop.set_valign(Gtk.Align.CENTER)
-        cur_blocked = int(safe_col(milestone, "blocked_by") or 0) if milestone else 0
-        if cur_blocked and cur_blocked in _dep_ids:
-            self._dep_drop.set_selected(_dep_ids.index(cur_blocked))
-        self._dep_ids = _dep_ids
-        dep_row.add_suffix(self._dep_drop)
-        fields.add(dep_row)
-
-        box.append(fields)
-
-        # ── Date entries ──────────────────────────────────────
-        date_grp = Adw.PreferencesGroup(title="Dates")
-
-        self._start = Adw.EntryRow(title="Start date  (+Nd / +Nw / +Nm)")
-        start_val = milestone["start_date"] if milestone else date.today().isoformat()
-        self._start.set_text(start_val)
-        self._start.connect("notify::text", lambda e, _: self._entry_changed("start"))
-        _wire_date_shortcut(self._start)
-        date_grp.add(self._start)
-
-        self._end = Adw.EntryRow(title="End date  (+Nd / +Nw / +Nm)")
-        end_val = milestone["end_date"] if milestone else date.today().isoformat()
-        self._end.set_text(end_val)
-        self._end.connect("notify::text", lambda e, _: self._entry_changed("end"))
-        _wire_date_shortcut(self._end)
-        date_grp.add(self._end)
-
-        box.append(date_grp)
-
-        # ── Calendar ──────────────────────────────────────────
-        cal_label = Gtk.Label(label="Calendar sets:", xalign=0)
-        cal_label.add_css_class("caption"); cal_label.add_css_class("dim-label")
-        box.append(cal_label)
-
-        radio_box = Gtk.Box(spacing=24)
-        self._r_start = Gtk.CheckButton(label="Start date", active=True)
-        self._r_end   = Gtk.CheckButton(label="End date")
-        self._r_end.set_group(self._r_start)
-        self._r_start.connect("toggled", self._on_radio)
-        self._r_end.connect("toggled", self._on_radio)
-        radio_box.append(self._r_start); radio_box.append(self._r_end)
-        box.append(radio_box)
-
-        self._cal = Gtk.Calendar()
-        self._cal.add_css_class("card")
-        # Block scroll events so the calendar doesn't hijack page scrolling
-        _no_scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL |
-            Gtk.EventControllerScrollFlags.HORIZONTAL
-        )
-        _no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_scroll.connect("scroll", lambda _c, _dx, _dy: True)
-        self._cal.add_controller(_no_scroll)
-        self._guard = True
-        self._cal_set(start_val)
-        self._guard = False
-        self._cal.connect("day-selected", self._on_day_selected)
-        box.append(self._cal)
-
-        # ── Save ──────────────────────────────────────────────
-        for er in (self._title_row, self._notes_row, self._tags_row,
-                   self._auto_tag_row, self._start, self._end):
-            er.connect("entry-activated", self._save)
-
-        btn = Gtk.Button(label="Save")
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._save)
-        box.append(btn)
-
-        scroll.set_child(box)
-        tv.set_content(scroll)
-        self.set_content(tv)
-
-    def _cal_set(self, date_str):
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            self._cal.select_day(
-                GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
-        except (ValueError, Exception):
-            pass
-
-    def _on_radio(self, btn):
-        if not btn.get_active(): return
-        self._cal_target = "start" if btn is self._r_start else "end"
-        # Sync calendar to the newly targeted entry
-        val = self._start.get_text() if self._cal_target == "start" else self._end.get_text()
-        self._guard = True
-        self._cal_set(val)
-        self._guard = False
-
-    def _on_day_selected(self, cal):
-        if self._guard: return
-        gdt = cal.get_date()
-        ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
-        self._guard = True
-        (self._start if self._cal_target == "start" else self._end).set_text(ds)
-        self._guard = False
-
-    def _entry_changed(self, which):
-        if self._guard: return
-        if which != self._cal_target: return
-        val = self._start.get_text() if which == "start" else self._end.get_text()
-        self._guard = True
-        self._cal_set(val)
-        self._guard = False
-
-    def _save(self, _):
-        title = self._title_row.get_text().strip()
-        start = expand_date_shortcut(self._start.get_text().strip())
-        end   = expand_date_shortcut(self._end.get_text().strip())
-        if not title or not start or not end: return
-        try:
-            datetime.strptime(start, "%Y-%m-%d")
-            datetime.strptime(end,   "%Y-%m-%d")
-        except ValueError:
-            return
-        notes      = self._notes_row.get_text().strip() or None
-        tags       = normalize_tag_input(self._tags_row.get_text())
-        auto_tag   = normalize_tag_input(self._auto_tag_row.get_text())
-        priority   = PRIORITIES[self._pri.get_selected()]
-        status     = MSTATUSES[self._mst.get_selected()]
-        completion = int(self._comp_scale.get_value())
-        blocked_by = self._dep_ids[self._dep_drop.get_selected()]
-        with get_db() as c:
-            if self._ms:
-                c.execute(
-                    "UPDATE milestone SET title=?,start_date=?,end_date=?,notes=?,tags=?,"
-                    "priority=?,status=?,completion=?,auto_tag=?,blocked_by=? WHERE id=?",
-                    (title, start, end, notes, tags, priority, status, completion,
-                     auto_tag, blocked_by, self._ms["id"]),
-                )
-            else:
-                c.execute(
-                    "INSERT INTO milestone (project_id,title,start_date,end_date,notes,tags,"
-                    "priority,status,completion,auto_tag,blocked_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (self._pid, title, start, end, notes, tags, priority, status, completion,
-                     auto_tag, blocked_by),
-                )
-        if self._on_save: self._on_save()
-        self.close()
-
-
-class EntryDialog(Adw.Window):
-    def __init__(self, parent, pid, entry=None, on_save=None):
-        super().__init__(
-            title="Edit Entry" if entry else "New Entry",
-            modal=True, transient_for=parent,
-            default_width=560, default_height=520, resizable=True,
-        )
-        self._pid = pid; self._entry = entry; self._on_save = on_save
-        tv = Adw.ToolbarView()
-        tv.add_top_bar(Adw.HeaderBar())
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
-                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        grp = Adw.PreferencesGroup()
-        self._title_row = Adw.EntryRow(title="Title")
-        if entry: self._title_row.set_text(entry["title"])
-        grp.add(self._title_row)
-        self._date_row = Adw.EntryRow(title="Date (YYYY-MM-DD)")
-        self._date_row.set_text(entry["date"] if entry else date.today().isoformat())
-        grp.add(self._date_row)
-        status_row = Adw.ActionRow(title="Status")
-        self._status = Gtk.DropDown.new_from_strings(ENTRY_STATUSES)
-        self._status.set_valign(Gtk.Align.CENTER)
-        if entry and entry["status"] in ENTRY_STATUSES:
-            self._status.set_selected(ENTRY_STATUSES.index(entry["status"]))
-        status_row.add_suffix(self._status)
-        grp.add(status_row)
-        self._tags_row = Adw.EntryRow(title="Labels")
-        self._tags_row.set_text(safe_col(entry, "tags") if entry else "")
-        grp.add(self._tags_row)
-        for er in (self._title_row, self._date_row, self._tags_row):
-            er.connect("entry-activated", self._save)
-        box.append(grp)
-        lbl = Gtk.Label(label="Content", xalign=0, margin_top=16, margin_bottom=4)
-        lbl.add_css_class("heading")
-        box.append(lbl)
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        scroll.add_css_class("card")
-        self._text = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD,
-                                  top_margin=8, bottom_margin=8,
-                                  left_margin=8, right_margin=8)
-        if entry and entry["content"]:
-            self._text.get_buffer().set_text(entry["content"])
-        scroll.set_child(self._text)
-        box.append(scroll)
-        btn = Gtk.Button(label="Save", margin_top=12)
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._save)
-        box.append(btn)
-        tv.set_content(box); self.set_content(tv)
-
-    def _save(self, _):
-        title = self._title_row.get_text().strip()
-        d     = self._date_row.get_text().strip()
-        if not title or not d: return
-        try: datetime.strptime(d, "%Y-%m-%d")
-        except ValueError: return
-        status = ENTRY_STATUSES[self._status.get_selected()]
-        tags   = normalize_tag_input(self._tags_row.get_text())
-        buf = self._text.get_buffer()
-        content = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True) or None
-        with get_db() as c:
-            if self._entry:
-                c.execute("UPDATE writing_entry SET title=?,content=?,status=?,date=?,tags=? WHERE id=?",
-                          (title, content, status, d, tags, self._entry["id"]))
-            else:
-                c.execute("INSERT INTO writing_entry (project_id,title,content,status,date,tags) VALUES (?,?,?,?,?,?)",
-                          (self._pid, title, content, status, d, tags))
-        if self._on_save: self._on_save()
-        self.close()
-
-
 class NoteDialog(Adw.Window):
     def __init__(self, parent, pid, note=None, on_save=None):
         super().__init__(
@@ -1739,45 +1310,172 @@ class NoteDialog(Adw.Window):
 
 
 class GoalEditDialog(Adw.Window):
-    def __init__(self, parent, goal, on_save=None):
-        super().__init__(title="Edit Goal", modal=True, transient_for=parent,
-                         default_width=420, default_height=320, resizable=True)
-        self._goal = goal; self._on_save = on_save
+    def __init__(self, parent, pid, goal=None, on_save=None):
+        super().__init__(
+            title="Edit Goal" if goal else "New Goal",
+            modal=True, transient_for=parent,
+            default_width=460, default_height=720, resizable=True,
+        )
+        self._pid = pid; self._goal = goal; self._on_save = on_save
+        self._cal_target = "end"
+        self._guard = False
+
         tv = Adw.ToolbarView()
         tv.add_top_bar(Adw.HeaderBar())
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        grp = Adw.PreferencesGroup()
-        self._text = Adw.EntryRow(title="Goal")
-        self._text.set_text(goal["text"])
-        grp.add(self._text)
-        self._tags = Adw.EntryRow(title="Labels")
-        self._tags.set_text(safe_col(goal, "tags"))
-        grp.add(self._tags)
-        self._due = Adw.EntryRow(title="Due date  (+Nd / +Nw / +Nm, optional)")
-        self._due.set_text(safe_col(goal, "due_date"))
-        _wire_date_shortcut(self._due)
-        grp.add(self._due)
-        for er in (self._text, self._tags, self._due):
+
+        fields = Adw.PreferencesGroup()
+
+        self._name = Adw.EntryRow(title="Goal name")
+        if goal: self._name.set_text(goal["text"])
+        fields.add(self._name)
+
+        self._notes_row = Adw.EntryRow(title="Notes")
+        self._notes_row.set_text(safe_col(goal, "notes") if goal else "")
+        fields.add(self._notes_row)
+
+        self._tags_row = Adw.EntryRow(title="Labels")
+        self._tags_row.set_text(safe_col(goal, "tags") if goal else "")
+        fields.add(self._tags_row)
+
+        st_row = Adw.ActionRow(title="Status")
+        self._status = Gtk.DropDown.new_from_strings(MSTATUSES)
+        self._status.set_valign(Gtk.Align.CENTER)
+        cur_st = safe_col(goal, "status") if goal else "pending"
+        self._status.set_selected(MSTATUSES.index(cur_st) if cur_st in MSTATUSES else 0)
+        st_row.add_suffix(self._status)
+        fields.add(st_row)
+
+        pri_row = Adw.ActionRow(title="Priority")
+        self._pri = Gtk.DropDown.new_from_strings(PRIORITIES)
+        self._pri.set_valign(Gtk.Align.CENTER)
+        cur_pri = safe_col(goal, "priority") if goal else "normal"
+        self._pri.set_selected(PRIORITIES.index(cur_pri) if cur_pri in PRIORITIES else 0)
+        pri_row.add_suffix(self._pri)
+        fields.add(pri_row)
+
+        with get_db() as c:
+            _all_goals = c.execute(
+                "SELECT id, text FROM goal WHERE project_id=? ORDER BY id", (pid,)
+            ).fetchall()
+        _other = [g for g in _all_goals if not goal or g["id"] != goal.get("id")]
+        _dep_labels = ["— none —"] + [g["text"] for g in _other]
+        _dep_ids    = [0] + [g["id"] for g in _other]
+        dep_row = Adw.ActionRow(title="Depends on")
+        self._dep_drop = Gtk.DropDown.new_from_strings(_dep_labels)
+        self._dep_drop.set_valign(Gtk.Align.CENTER)
+        cur_blocked = int(safe_col(goal, "blocked_by") or 0) if goal else 0
+        if cur_blocked in _dep_ids:
+            self._dep_drop.set_selected(_dep_ids.index(cur_blocked))
+        self._dep_ids = _dep_ids
+        dep_row.add_suffix(self._dep_drop)
+        fields.add(dep_row)
+
+        box.append(fields)
+
+        date_grp = Adw.PreferencesGroup(title="Dates")
+        self._start = Adw.EntryRow(title="Start date  (+Nd / +Nw / +Nm)")
+        self._start.set_text(safe_col(goal, "start_date") if goal else "")
+        self._start.connect("notify::text", lambda e, _: self._entry_changed("start"))
+        _wire_date_shortcut(self._start)
+        date_grp.add(self._start)
+
+        self._end = Adw.EntryRow(title="End date  (+Nd / +Nw / +Nm)")
+        self._end.set_text(safe_col(goal, "end_date") if goal else "")
+        self._end.connect("notify::text", lambda e, _: self._entry_changed("end"))
+        _wire_date_shortcut(self._end)
+        date_grp.add(self._end)
+        box.append(date_grp)
+
+        cal_label = Gtk.Label(label="Calendar sets:", xalign=0)
+        cal_label.add_css_class("caption"); cal_label.add_css_class("dim-label")
+        box.append(cal_label)
+
+        radio_box = Gtk.Box(spacing=24)
+        self._r_start = Gtk.CheckButton(label="Start date")
+        self._r_end   = Gtk.CheckButton(label="End date", active=True)
+        self._r_end.set_group(self._r_start)
+        self._r_start.connect("toggled", self._on_radio)
+        self._r_end.connect("toggled", self._on_radio)
+        radio_box.append(self._r_start); radio_box.append(self._r_end)
+        box.append(radio_box)
+
+        self._cal = Gtk.Calendar()
+        self._cal.add_css_class("card")
+        _no_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
+        _no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        _no_scroll.connect("scroll", lambda _c, _dx, _dy: True)
+        self._cal.add_controller(_no_scroll)
+        self._cal.connect("day-selected", self._on_day_selected)
+        box.append(self._cal)
+
+        for er in (self._name, self._notes_row, self._tags_row, self._start, self._end):
             er.connect("entry-activated", self._save)
-        box.append(grp)
-        btn = Gtk.Button(label="Save", margin_top=18)
+
+        btn = Gtk.Button(label="Save")
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
         box.append(btn)
-        tv.set_content(box); self.set_content(tv)
 
-    def _save(self, _):
-        text = self._text.get_text().strip()
-        if not text: return
-        tags = normalize_tag_input(self._tags.get_text())
-        due  = expand_date_shortcut(self._due.get_text().strip())
-        if due:
-            try: datetime.strptime(due, "%Y-%m-%d")
-            except ValueError: due = ""
+        scroll.set_child(box)
+        tv.set_content(scroll)
+        self.set_content(tv)
+
+    def _cal_set(self, date_str):
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+        except Exception:
+            pass
+
+    def _on_radio(self, btn):
+        if not btn.get_active(): return
+        self._cal_target = "start" if btn is self._r_start else "end"
+        val = self._start.get_text() if self._cal_target == "start" else self._end.get_text()
+        self._guard = True; self._cal_set(val); self._guard = False
+
+    def _on_day_selected(self, cal):
+        if self._guard: return
+        gdt = cal.get_date()
+        ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
+        self._guard = True
+        (self._start if self._cal_target == "start" else self._end).set_text(ds)
+        self._guard = False
+
+    def _entry_changed(self, which):
+        if self._guard: return
+        if which != self._cal_target: return
+        val = self._start.get_text() if which == "start" else self._end.get_text()
+        self._guard = True; self._cal_set(val); self._guard = False
+
+    def _save(self, *_):
+        name = self._name.get_text().strip()
+        if not name: return
+        status   = MSTATUSES[self._status.get_selected()]
+        priority = PRIORITIES[self._pri.get_selected()]
+        tags     = normalize_tag_input(self._tags_row.get_text())
+        notes    = self._notes_row.get_text().strip()
+        start    = expand_date_shortcut(self._start.get_text().strip()) or ""
+        end      = expand_date_shortcut(self._end.get_text().strip()) or ""
+        done     = 1 if status == "done" else 0
+        due_date = end
+        blocked_by = self._dep_ids[self._dep_drop.get_selected()]
         with get_db() as c:
-            c.execute("UPDATE goal SET text=?, tags=?, due_date=? WHERE id=?",
-                      (text, tags, due, self._goal["id"]))
+            if self._goal:
+                c.execute(
+                    "UPDATE goal SET text=?,status=?,priority=?,tags=?,notes=?,"
+                    "start_date=?,end_date=?,done=?,due_date=?,blocked_by=? WHERE id=?",
+                    (name, status, priority, tags, notes, start, end, done, due_date, blocked_by, self._goal["id"])
+                )
+            else:
+                c.execute(
+                    "INSERT INTO goal (project_id,text,status,priority,tags,notes,start_date,end_date,done,due_date,blocked_by)"
+                    " VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+                    (self._pid, name, status, priority, tags, notes, start, end, due_date, blocked_by)
+                )
         if self._on_save: self._on_save()
         self.close()
 
@@ -1864,323 +1562,6 @@ class QuickTaskDialog(Adw.Window):
         self.close()
 
 
-class TemplateEditDialog(Adw.Window):
-    """Create or edit a milestone template (name + list of items with offsets)."""
-    def __init__(self, parent, template=None, on_save=None):
-        super().__init__(
-            title="Edit Template" if template else "New Template",
-            modal=True, transient_for=parent,
-            default_width=460, default_height=540,
-        )
-        self._template = template; self._on_save = on_save
-        self._items = []  # list of {title, day_offset, duration_days} dicts
-
-        tv = Adw.ToolbarView()
-        tv.add_top_bar(Adw.HeaderBar())
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                        margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-
-        # Name
-        name_grp = Adw.PreferencesGroup()
-        self._name_row = Adw.EntryRow(title="Template name")
-        if template: self._name_row.set_text(template["name"])
-        name_grp.add(self._name_row)
-        outer.append(name_grp)
-
-        # Items list
-        self._items_grp = Adw.PreferencesGroup(title="Milestones")
-        add_item_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_item_btn.add_css_class("flat")
-        add_item_btn.connect("clicked", self._add_item_row)
-        self._items_grp.set_header_suffix(add_item_btn)
-        outer.append(self._items_grp)
-
-        # Load existing items
-        if template:
-            for it in db_template_items(template["id"]):
-                self._items.append({
-                    "title": it["title"],
-                    "day_offset": it["day_offset"],
-                    "duration_days": it["duration_days"],
-                })
-            self._rebuild_items_ui()
-
-        btn = Gtk.Button(label="Save template")
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._save)
-        outer.append(btn)
-
-        scroll.set_child(outer)
-        tv.set_content(scroll)
-        self.set_content(tv)
-
-    def _add_item_row(self, _=None):
-        self._items.append({"title": "", "day_offset": len(self._items) * 7, "duration_days": 7})
-        self._rebuild_items_ui()
-
-    def _rebuild_items_ui(self):
-        # Remove all children from items_grp and re-add
-        if not hasattr(self, "_item_box"):
-            self._item_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            self._items_grp.add(self._item_box)
-        clear_box(self._item_box)
-        for idx, it in enumerate(self._items):
-            row_box = Gtk.Box(spacing=6)
-            title_entry = Gtk.Entry(placeholder_text="Milestone title", hexpand=True)
-            title_entry.set_text(it["title"])
-            title_entry.connect("changed", lambda e, i=idx: self._items.__setitem__(i, {**self._items[i], "title": e.get_text()}))
-            offset_spin = Gtk.SpinButton.new_with_range(0, 3650, 1)
-            offset_spin.set_value(it["day_offset"])
-            offset_spin.set_tooltip_text("Start offset (days from template start)")
-            offset_spin.connect("value-changed", lambda s, i=idx: self._items.__setitem__(i, {**self._items[i], "day_offset": int(s.get_value())}))
-            dur_spin = Gtk.SpinButton.new_with_range(1, 365, 1)
-            dur_spin.set_value(it["duration_days"])
-            dur_spin.set_tooltip_text("Duration (days)")
-            dur_spin.connect("value-changed", lambda s, i=idx: self._items.__setitem__(i, {**self._items[i], "duration_days": int(s.get_value())}))
-            del_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
-            del_btn.connect("clicked", lambda _, i=idx: (self._items.pop(i), self._rebuild_items_ui()))
-            row_box.append(title_entry)
-            offset_lbl = Gtk.Label(label="+d"); offset_lbl.add_css_class("dim-label")
-            row_box.append(offset_lbl); row_box.append(offset_spin)
-            dur_lbl = Gtk.Label(label="×d"); dur_lbl.add_css_class("dim-label")
-            row_box.append(dur_lbl); row_box.append(dur_spin)
-            row_box.append(del_btn)
-            self._item_box.append(row_box)
-
-    def _save(self, _):
-        name = self._name_row.get_text().strip()
-        if not name: return
-        with get_db() as c:
-            if self._template:
-                c.execute("UPDATE template SET name=? WHERE id=?", (name, self._template["id"]))
-                c.execute("DELETE FROM template_item WHERE template_id=?", (self._template["id"],))
-                tid = self._template["id"]
-            else:
-                c.execute("INSERT INTO template (name) VALUES (?)", (name,))
-                tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-            for it in self._items:
-                if it["title"].strip():
-                    c.execute(
-                        "INSERT INTO template_item (template_id,title,day_offset,duration_days)"
-                        " VALUES (?,?,?,?)",
-                        (tid, it["title"].strip(), it["day_offset"], it["duration_days"]),
-                    )
-        if self._on_save: self._on_save()
-        self.close()
-
-
-class TemplatesWindow(Adw.Window):
-    """Browse, create, edit, delete and apply milestone templates."""
-    def __init__(self, parent, pid, on_apply=None):
-        super().__init__(
-            title="Milestone Templates",
-            modal=True, transient_for=parent,
-            default_width=500, default_height=540,
-        )
-        self._pid = pid; self._parent = parent; self._on_apply = on_apply
-        tv = Adw.ToolbarView()
-        hdr = Adw.HeaderBar()
-        new_btn = Gtk.Button(icon_name="list-add-symbolic")
-        new_btn.add_css_class("flat")
-        new_btn.set_tooltip_text("New template")
-        new_btn.connect("clicked", lambda _: TemplateEditDialog(
-            self, on_save=self._rebuild).present())
-        hdr.pack_end(new_btn)
-        tv.add_top_bar(hdr)
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        self._box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                            margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        scroll.set_child(self._box)
-        tv.set_content(scroll)
-        self.set_content(tv)
-        self._rebuild()
-
-    def _rebuild(self):
-        clear_box(self._box)
-        templates = db_templates()
-        if not templates:
-            sp = Adw.StatusPage(title="No templates yet",
-                                description="Press + to create a template",
-                                icon_name="document-new-symbolic")
-            sp.set_vexpand(True)
-            self._box.append(sp)
-            return
-        grp = Adw.PreferencesGroup(title="Templates")
-        for tmpl in templates:
-            items = db_template_items(tmpl["id"])
-            sub = f"{len(items)} milestone{'s' if len(items)!=1 else ''}"
-            row = Adw.ActionRow(title=tmpl["name"], subtitle=sub)
-            apply_btn = Gtk.Button(label="Apply")
-            apply_btn.add_css_class("flat"); apply_btn.add_css_class("accent")
-            apply_btn.set_valign(Gtk.Align.CENTER)
-            apply_btn.connect("clicked", lambda _, t=tmpl: self._apply(t))
-            edit_btn = Gtk.Button(icon_name="document-edit-symbolic")
-            edit_btn.add_css_class("flat"); edit_btn.set_valign(Gtk.Align.CENTER)
-            edit_btn.connect("clicked", lambda _, t=tmpl: TemplateEditDialog(
-                self, template=t, on_save=self._rebuild).present())
-            del_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
-            del_btn.set_valign(Gtk.Align.CENTER)
-            del_btn.connect("clicked", lambda _, tid=tmpl["id"]: self._delete(tid))
-            row.add_suffix(apply_btn); row.add_suffix(edit_btn); row.add_suffix(del_btn)
-            grp.add(row)
-        self._box.append(grp)
-
-        # Save current milestones as template
-        save_grp = Adw.PreferencesGroup()
-        save_row = Adw.ActionRow(
-            title="Save current project milestones as template",
-            subtitle="Creates a new template from this project's milestones",
-        )
-        save_btn = Gtk.Button(label="Save")
-        save_btn.add_css_class("flat"); save_btn.set_valign(Gtk.Align.CENTER)
-        save_btn.connect("clicked", self._save_current)
-        save_row.add_suffix(save_btn)
-        save_grp.add(save_row)
-        self._box.append(save_grp)
-
-    def _apply(self, tmpl):
-        ApplyTemplateDialog(self, self._pid, tmpl,
-                            on_apply=self._on_apply).present()
-
-    def _save_current(self, _):
-        ms = db_milestones(self._pid)
-        if not ms:
-            return
-        # Compute day offsets relative to the earliest start_date
-        try:
-            base = min(datetime.strptime(m["start_date"], "%Y-%m-%d") for m in ms)
-        except ValueError:
-            return
-        proj = db_project(self._pid)
-        name = f"{proj['name'] if proj else 'Project'} template"
-        with get_db() as c:
-            c.execute("INSERT INTO template (name) VALUES (?)", (name,))
-            tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-            for m in ms:
-                try:
-                    s = datetime.strptime(m["start_date"], "%Y-%m-%d")
-                    e = datetime.strptime(m["end_date"],   "%Y-%m-%d")
-                    off = (s - base).days
-                    dur = max(1, (e - s).days)
-                    c.execute(
-                        "INSERT INTO template_item (template_id,title,day_offset,duration_days)"
-                        " VALUES (?,?,?,?)",
-                        (tid, m["title"], off, dur),
-                    )
-                except ValueError:
-                    pass
-        self._rebuild()
-
-    def _delete(self, tid):
-        with get_db() as c:
-            c.execute("DELETE FROM template WHERE id=?", (tid,))
-        self._rebuild()
-
-
-class ApplyTemplateDialog(Adw.Window):
-    """Pick a start date and apply a template to the current project."""
-    def __init__(self, parent, pid, template, on_apply=None):
-        super().__init__(
-            title=f'Apply “{template["name"]}”',
-            modal=True, transient_for=parent,
-            default_width=380, default_height=500,
-        )
-        self._pid = pid; self._template = template; self._on_apply = on_apply
-        self._guard = False
-
-        tv = Adw.ToolbarView()
-        tv.add_top_bar(Adw.HeaderBar())
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-
-        # Preview items
-        items = db_template_items(template["id"])
-        if items:
-            grp = Adw.PreferencesGroup(title="Will create")
-            for it in items:
-                s = it["day_offset"]
-                e = s + it["duration_days"]
-                grp.add(Adw.ActionRow(
-                    title=it["title"],
-                    subtitle=f"day {s} → day {e}",
-                ))
-            box.append(grp)
-
-        # Start date
-        date_grp = Adw.PreferencesGroup(title="Start date")
-        self._date_entry = Adw.EntryRow(title="YYYY-MM-DD")
-        self._date_entry.set_text(date.today().isoformat())
-        self._date_entry.connect("notify::text", lambda e, _: self._on_entry())
-        date_grp.add(self._date_entry)
-        box.append(date_grp)
-
-        self._cal = Gtk.Calendar()
-        self._cal.add_css_class("card")
-        no_scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        no_scroll.connect("scroll", lambda *_: True)
-        self._cal.add_controller(no_scroll)
-        self._guard = True
-        try:
-            today = date.today()
-            self._cal.select_day(GLib.DateTime.new_local(today.year, today.month, today.day, 0, 0, 0.0))
-        except Exception:
-            pass
-        self._guard = False
-        self._cal.connect("day-selected", self._on_cal)
-        box.append(self._cal)
-
-        btn = Gtk.Button(label="Apply template")
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._apply)
-        box.append(btn)
-
-        scroll.set_child(box)
-        tv.set_content(scroll)
-        self.set_content(tv)
-
-    def _on_cal(self, cal):
-        if self._guard: return
-        gdt = cal.get_date()
-        ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
-        self._guard = True
-        self._date_entry.set_text(ds)
-        self._guard = False
-
-    def _on_entry(self):
-        if self._guard: return
-        try:
-            dt = datetime.strptime(self._date_entry.get_text(), "%Y-%m-%d")
-            self._guard = True
-            self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
-            self._guard = False
-        except ValueError:
-            pass
-
-    def _apply(self, _):
-        try:
-            base = datetime.strptime(self._date_entry.get_text().strip(), "%Y-%m-%d")
-        except ValueError:
-            return
-        items = db_template_items(self._template["id"])
-        with get_db() as c:
-            for it in items:
-                s = (base + timedelta(days=it["day_offset"])).strftime("%Y-%m-%d")
-                e = (base + timedelta(days=it["day_offset"] + it["duration_days"])).strftime("%Y-%m-%d")
-                c.execute(
-                    "INSERT INTO milestone (project_id,title,start_date,end_date,status,priority)"
-                    " VALUES (?,?,?,?,'pending','normal')",
-                    (self._pid, it["title"], s, e),
-                )
-        if self._on_apply: self._on_apply()
-        self.close()
-
-
 class TodoEditDialog(Adw.Window):
     def __init__(self, parent, todo, on_save=None):
         super().__init__(
@@ -2236,6 +1617,24 @@ class TodoEditDialog(Adw.Window):
         blocked_row.add_suffix(self._blocked_spin)
         grp.add(blocked_row)
 
+        # Goal assignment
+        with get_db() as c:
+            _goals = c.execute(
+                "SELECT id, text FROM goal WHERE project_id=? AND done=0 ORDER BY id",
+                (todo["project_id"],)
+            ).fetchall()
+        _goal_labels = ["— none —"] + [g["text"] for g in _goals]
+        _goal_ids    = [None] + [g["id"] for g in _goals]
+        goal_row = Adw.ActionRow(title="Assign to goal", subtitle="Optional — groups this task under a goal")
+        self._goal_drop = Gtk.DropDown.new_from_strings(_goal_labels)
+        self._goal_drop.set_valign(Gtk.Align.CENTER)
+        cur_goal = safe_col(todo, "goal_id")
+        if cur_goal and int(cur_goal or 0) in _goal_ids:
+            self._goal_drop.set_selected(_goal_ids.index(int(cur_goal)))
+        self._goal_ids = _goal_ids
+        goal_row.add_suffix(self._goal_drop)
+        grp.add(goal_row)
+
         for er in (self._text, self._tags, self._due):
             er.connect("entry-activated", self._save)
         box.append(grp)
@@ -2254,10 +1653,11 @@ class TodoEditDialog(Adw.Window):
         priority   = PRIORITIES[self._pri.get_selected()]
         recur_days = int(self._recur_spin.get_value())
         due_date   = expand_date_shortcut(self._due.get_text().strip()) or None
+        goal_id = self._goal_ids[self._goal_drop.get_selected()]
         with get_db() as c:
             c.execute(
-                "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, blocked_by=?, due_date=? WHERE id=?",
-                (text, tags, priority, recur_days, int(self._blocked_spin.get_value()), due_date, self._todo["id"]),
+                "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, blocked_by=?, due_date=?, goal_id=? WHERE id=?",
+                (text, tags, priority, recur_days, int(self._blocked_spin.get_value()), due_date, goal_id, self._todo["id"]),
             )
         if self._on_save:
             self._on_save()
@@ -2288,221 +1688,6 @@ class ChangelogDialog(Adw.Window):
 # ══════════════════════════════════════════════════════
 # Section views
 # ══════════════════════════════════════════════════════
-
-class TimelineView(Gtk.Box):
-    def __init__(self, pid, project, win):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                         margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
-        self._pid = pid; self._project = project; self._win = win
-
-        tb = tip_banner("milestones",
-            "Use +7d / +2w / +1m in date fields as shortcuts. Set 'Depends on' "
-            "in the edit dialog to draw dependency arrows. ⇄ shifts all dates at once.")
-        if tb: self.append(tb)
-
-        # ── Persistent year selector ───────────────────────────
-        today = date.today()
-        self._year_opts = (
-            ["All", "3 months", "6 months"] +
-            [str(y) for y in range(today.year - 1, today.year + 9)]
-        )
-        self._year_drop = Gtk.DropDown.new_from_strings(self._year_opts)
-        self._year_drop.set_selected(4)  # current year: All, 3m, 6m, prev_year, cur_year
-        self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild))
-
-        tmpl_btn = Gtk.Button(icon_name="document-open-recent-symbolic")
-        tmpl_btn.add_css_class("flat")
-        tmpl_btn.set_tooltip_text("Milestone templates")
-        tmpl_btn.connect("clicked", lambda _: TemplatesWindow(
-            self._win, self._pid, on_apply=self._rebuild).present())
-
-        shift_btn = Gtk.Button(icon_name="object-flip-horizontal-symbolic")
-        shift_btn.add_css_class("flat")
-        shift_btn.set_tooltip_text("Shift all milestone dates")
-        shift_btn.connect("clicked", self._shift_dates_dialog)
-
-        hdr = Gtk.Box(spacing=10, margin_bottom=2)
-        hdr.append(Gtk.Label(label="View:"))
-        hdr.append(self._year_drop)
-        hdr.append(tmpl_btn)
-        hdr.append(shift_btn)
-        self.append(hdr)
-
-        # ── Rebuilt content ────────────────────────────────────
-        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.append(self._content)
-
-        sc = Gtk.ShortcutController()
-        sc.set_scope(Gtk.ShortcutScope.MANAGED)
-        sc.add_shortcut(Gtk.Shortcut.new(
-            Gtk.KeyvalTrigger.new(Gdk.KEY_n, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: (
-                MilestoneDialog(self._win, self._pid, on_save=self._rebuild).present(), True)[1]),
-        ))
-        self.add_controller(sc)
-
-        self._rebuild()
-
-    # ── Helpers ────────────────────────────────────────────────
-
-    def _view_range(self):
-        opt = self._year_opts[self._year_drop.get_selected()]
-        if opt == "All":
-            return None, None
-        today = date.today()
-        start = datetime(today.year, today.month, today.day)
-        if opt == "3 months":
-            return start, _months_later(start, 3)
-        if opt == "6 months":
-            return start, _months_later(start, 6)
-        y = int(opt)
-        return datetime(y, 1, 1), datetime(y, 12, 31)
-
-    def _ms_in_range(self, m, vstart, vend):
-        try:
-            s = datetime.strptime(m["start_date"], "%Y-%m-%d")
-            e = datetime.strptime(m["end_date"], "%Y-%m-%d")
-            return e >= vstart and s <= vend
-        except ValueError:
-            return False
-
-    # ── Build ──────────────────────────────────────────────────
-
-    def _rebuild(self):
-        sync_milestone_auto_tags(self._pid)
-        clear_box(self._content)
-        ms = db_milestones(self._pid)
-        vstart, vend = self._view_range()
-
-        chart_ms = [m for m in ms if self._ms_in_range(m, vstart, vend)] if vstart else ms
-
-        if chart_ms:
-            self._content.append(GanttChart(chart_ms, self._project["color"], vstart, vend))
-        elif ms:
-            lbl = Gtk.Label(label="No milestones in this period")
-            lbl.add_css_class("dim-label"); lbl.set_margin_top(8)
-            self._content.append(lbl)
-
-        grp = Adw.PreferencesGroup(title="Milestones")
-        add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.add_css_class("flat")
-        add_btn.connect("clicked", lambda _: MilestoneDialog(
-            self._win, self._pid, on_save=self._rebuild).present())
-        grp.set_header_suffix(add_btn)
-
-        if not ms:
-            grp.add(Adw.ActionRow(title="No milestones yet — press + to add one"))
-        for m in ms:
-            grp.add(self._make_row(m))
-        self._content.append(grp)
-
-    def _make_row(self, m):
-        status   = safe_col(m, "status")   or "pending"
-        priority = safe_col(m, "priority") or "normal"
-        notes    = safe_col(m, "notes")    or ""
-
-        comp = int(safe_col(m, "completion") or 0)
-        sub_parts = [f"{m['start_date']} → {m['end_date']}"]
-        if comp:
-            sub_parts.append(f"{comp}% done")
-        if notes:
-            sub_parts.append(notes)
-        row = Adw.ActionRow(title=m["title"])
-        row.set_subtitle(" · ".join(sub_parts))
-
-        # Priority label prefix
-        pri_lbl = Gtk.Label(label=priority.upper())
-        pri_lbl.add_css_class("caption")
-        pri_lbl.add_css_class({
-            "high": "error", "low": "accent", "normal": "dim-label",
-        }.get(priority, "dim-label"))
-        pri_lbl.set_valign(Gtk.Align.CENTER)
-        pri_lbl.set_size_request(52, -1)
-        pri_lbl.set_xalign(0.5)
-        row.add_prefix(pri_lbl)
-
-        # Priority bar (left edge, same as todos)
-        if priority in ("high", "low"):
-            bar = Gtk.Box(); bar.set_size_request(4, -1)
-            bar.set_valign(Gtk.Align.FILL)
-            bar.add_css_class("priority-bar")
-            bar.add_css_class(f"priority-{priority}")
-            row.add_prefix(bar)
-
-        # Status badge
-        badge = Gtk.Label(label=status)
-        badge.add_css_class("caption")
-        badge.add_css_class({
-            "done": "success", "active": "accent",
-            "blocked": "error", "pending": "dim-label",
-        }.get(status, "dim-label"))
-        badge.set_valign(Gtk.Align.CENTER)
-        row.add_suffix(badge)
-
-        # Edit button
-        eb = Gtk.Button(icon_name="document-edit-symbolic")
-        eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
-        ms_snap = dict(m)
-        eb.connect("clicked", lambda _, ms=ms_snap: MilestoneDialog(
-            self._win, self._pid, milestone=ms, on_save=self._rebuild).present())
-        add_dblclick(row, lambda ms=ms_snap: MilestoneDialog(
-            self._win, self._pid, milestone=ms, on_save=self._rebuild).present())
-        row.add_suffix(eb)
-
-        # Delete button
-        db_btn = Gtk.Button(icon_name="user-trash-symbolic")
-        db_btn.add_css_class("flat"); db_btn.add_css_class("destructive-action")
-        db_btn.set_valign(Gtk.Align.CENTER)
-        db_btn.connect("clicked", lambda _, mid=m["id"]: self._delete(mid))
-        row.add_suffix(db_btn)
-
-        return row
-
-    def _delete(self, mid):
-        with get_db() as c:
-            c.execute("DELETE FROM milestone WHERE id=?", (mid,))
-        GLib.idle_add(self._rebuild)
-
-    def _shift_dates_dialog(self, _):
-        ms = db_milestones(self._pid)
-        if not ms:
-            return
-        dlg = Adw.Window(title="Shift all milestone dates", modal=True,
-                         transient_for=self._win, default_width=360, resizable=False)
-        tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        grp = Adw.PreferencesGroup(
-            title="Shift all dates",
-            description=f"Moves every milestone's start and end date by the specified number of days. Positive = forward, negative = backward. Affects all {len(ms)} milestone{'s' if len(ms)!=1 else ''}."
-        )
-        days_row = Adw.ActionRow(title="Days to shift")
-        spin = Gtk.SpinButton.new_with_range(-3650, 3650, 1)
-        spin.set_value(0); spin.set_valign(Gtk.Align.CENTER)
-        days_row.add_suffix(spin)
-        grp.add(days_row)
-        box.append(grp)
-        def _do_shift(_):
-            days = int(spin.get_value())
-            if days == 0:
-                dlg.close(); return
-            with get_db() as c:
-                for m in ms:
-                    try:
-                        new_s = (datetime.strptime(m["start_date"], "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
-                        new_e = (datetime.strptime(m["end_date"],   "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
-                        c.execute("UPDATE milestone SET start_date=?, end_date=? WHERE id=?",
-                                  (new_s, new_e, m["id"]))
-                    except ValueError:
-                        pass
-            dlg.close()
-            GLib.idle_add(self._rebuild)
-        apply_btn = Gtk.Button(label="Apply shift", margin_top=4)
-        apply_btn.add_css_class("suggested-action"); apply_btn.add_css_class("pill")
-        apply_btn.connect("clicked", _do_shift)
-        box.append(apply_btn)
-        tv.set_content(box); dlg.set_content(tv); dlg.present()
-
 
 class TodosView(Gtk.Box):
     def __init__(self, pid, win):
@@ -2980,7 +2165,6 @@ class TodosView(Gtk.Box):
                          safe_col(r,"tags") or "", due_back, recur,
                          int(safe_col(r,"estimate_mins") or 0)),
                     )
-        sync_milestone_auto_tags(self._pid)
         GLib.idle_add(self._build_content)
 
     def _update_priority(self, tid, priority):
@@ -3002,412 +2186,124 @@ class GoalsView(Gtk.Box):
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
         self._pid = pid; self._win = win; self._push_fn = push_fn
 
-        tb = tip_banner("goals",
-            "Click a goal (or press →) to open it and add sub-tasks, a due date, and labels. "
-            "Type #tag in the goal name to label it instantly.")
+        tb = tip_banner("goals_v2",
+            "Goals act as milestones on the Gantt chart — set a start and end date to see them plotted. "
+            "Assign tasks to a goal to group them. Use +7d / +2w in date fields as shortcuts.")
         if tb: self.append(tb)
-
-        self._build()
-
-    def _build(self):
-        # ── Add goal entry (at top, like to-do list) ─────────
-        add_grp = Adw.PreferencesGroup()
-        self._entry_row = Adw.EntryRow(title="New goal  (type #tag to label, press Enter)")
-        entry_row = self._entry_row
-        entry_row.connect("entry-activated",
-            lambda r: self._add(r.get_text().strip()) or r.set_text(""))
-        add_grp.add(entry_row)
-        self.append(add_grp)
 
         sc = Gtk.ShortcutController()
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
         sc.add_shortcut(Gtk.Shortcut.new(
             Gtk.KeyvalTrigger.new(Gdk.KEY_n, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: self._entry_row.grab_focus() or True),
+            Gtk.CallbackAction.new(lambda *_: (
+                GoalEditDialog(self._win, self._pid, on_save=self._refresh).present(), True)[1]),
         ))
         self.add_controller(sc)
 
-        goals = db_goals(self._pid)
-        grp = Adw.PreferencesGroup(title="Goals")
-        if not goals:
-            grp.add(Adw.ActionRow(title="No goals yet — add one above"))
-        for g in goals:
-            tags = get_tags(safe_col(g, "tags"))
-            due  = safe_col(g, "due_date")
-            subtasks = db_goal_todos(g["id"])
-            done_st  = sum(1 for s in subtasks if s["done"])
-
-            row = Adw.ActionRow(title=g["text"])
-            sub_parts = []
-            if due and not g["done"]:
-                try:
-                    dl = (datetime.strptime(due, "%Y-%m-%d").date() - date.today()).days
-                    if dl < 0:    sub_parts.append(f"overdue {-dl}d")
-                    elif dl == 0: sub_parts.append("due today!")
-                    elif dl == 1: sub_parts.append("due tomorrow")
-                    else:         sub_parts.append(f"due {due}")
-                except ValueError:
-                    pass
-            if subtasks:
-                sub_parts.append(f"{done_st}/{len(subtasks)} steps done")
-            if tags:
-                sub_parts.append("  ".join(f"#{t}" for t in tags))
-            if sub_parts:
-                row.set_subtitle("  ·  ".join(sub_parts))
-
-            check = Gtk.CheckButton(active=bool(g["done"]))
-            check.set_valign(Gtk.Align.CENTER)
-            gid = g["id"]
-            check.connect("toggled", lambda b, i=gid: self._toggle(i))
-            row.add_prefix(check)
-
-            g_snap = dict(g)
-
-            def _open_detail(gs=g_snap):
-                if self._push_fn:
-                    self._push_fn(gs["text"], GoalDetailView(gs["id"], self._pid, self._win, on_save=self._refresh))
-
-            open_btn = Gtk.Button(icon_name="go-next-symbolic")
-            open_btn.add_css_class("flat"); open_btn.set_valign(Gtk.Align.CENTER)
-            open_btn.set_tooltip_text("Open goal details")
-            open_btn.connect("clicked", lambda _, f=_open_detail: f())
-            add_dblclick(row, _open_detail)
-            row.set_activatable(True)
-            row.connect("activated", lambda _, f=_open_detail: f())
-
-            db_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            db_btn.add_css_class("flat"); db_btn.add_css_class("destructive-action")
-            db_btn.set_valign(Gtk.Align.CENTER)
-            db_btn.connect("clicked", lambda _, i=gid: self._delete(i))
-            row.add_suffix(open_btn); row.add_suffix(db_btn)
-            grp.add(row)
-        self.append(grp)
+        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.append(self._content)
+        self._refresh()
 
     def _refresh(self):
-        clear_box(self); self._build()
+        clear_box(self._content)
+        goals = db_goals(self._pid)
 
-    def _toggle(self, gid):
+        grp = Adw.PreferencesGroup(title="Goals")
+        add_btn = Gtk.Button(icon_name="list-add-symbolic")
+        add_btn.add_css_class("flat")
+        add_btn.connect("clicked", lambda _: GoalEditDialog(self._win, self._pid, on_save=self._refresh).present())
+        grp.set_header_suffix(add_btn)
+
+        if not goals:
+            grp.add(Adw.ActionRow(title="No goals yet — press + to add one"))
+        for g in goals:
+            g_snap = dict(g)
+            priority = safe_col(g, "priority") or "normal"
+            status   = safe_col(g, "status")   or "pending"
+            start    = safe_col(g, "start_date")
+            end      = safe_col(g, "end_date")
+
+            row = Adw.ActionRow(title=g["text"])
+            sub = f"{start} → {end}" if start and end else (end if end else "No dates set")
+            notes = safe_col(g, "notes")
+            if notes: sub += f"  ·  {notes}"
+            row.set_subtitle(sub)
+
+            pri_lbl = Gtk.Label(label=priority.upper())
+            pri_lbl.add_css_class("caption")
+            pri_lbl.add_css_class({"high": "error", "low": "accent", "normal": "dim-label"}.get(priority, "dim-label"))
+            pri_lbl.set_valign(Gtk.Align.CENTER)
+            pri_lbl.set_size_request(52, -1)
+            pri_lbl.set_xalign(0.5)
+            row.add_prefix(pri_lbl)
+
+            badge = Gtk.Label(label=status)
+            badge.add_css_class("caption")
+            badge.add_css_class({"done": "success", "active": "accent", "blocked": "error", "pending": "dim-label"}.get(status, "dim-label"))
+            badge.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(badge)
+
+            eb = Gtk.Button(icon_name="document-edit-symbolic")
+            eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
+            eb.connect("clicked", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
+            add_dblclick(row, lambda gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
+            row.add_suffix(eb)
+
+            done_cb = Gtk.CheckButton(active=bool(g["done"]))
+            done_cb.set_valign(Gtk.Align.CENTER)
+            done_cb.set_tooltip_text("Mark done")
+            done_cb.connect("toggled", lambda b, gid=g["id"]: self._toggle_done(gid, b.get_active()))
+            row.add_suffix(done_cb)
+
+            del_btn = Gtk.Button(icon_name="user-trash-symbolic")
+            del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
+            del_btn.set_valign(Gtk.Align.CENTER)
+            del_btn.connect("clicked", lambda _, gid=g["id"]: self._delete(gid))
+            row.add_suffix(del_btn)
+
+            if g["done"]:
+                row.add_css_class("dim-label")
+
+            grp.add(row)
+
+        self._content.append(grp)
+
+        linked_todos = [t for t in db_todos(self._pid) if safe_col(t, "goal_id")]
+        if linked_todos:
+            goal_map = {g["id"]: g["text"] for g in goals}
+            from collections import defaultdict
+            by_goal = defaultdict(list)
+            for t in linked_todos:
+                by_goal[safe_col(t, "goal_id")].append(t)
+            linked_grp = Adw.PreferencesGroup(title="Tasks linked to goals")
+            for gid, tasks in by_goal.items():
+                for t in tasks:
+                    goal_name = goal_map.get(gid, "Unknown goal")
+                    trow = Adw.ActionRow(title=t["text"], subtitle=f"→ {goal_name}")
+                    if t["done"]:
+                        trow.add_css_class("dim-label")
+                    linked_grp.add(trow)
+            self._content.append(linked_grp)
+
+        goals_with_dates = [g for g in goals if safe_col(g, "start_date") and safe_col(g, "end_date")]
+        if goals_with_dates:
+            gantt_lbl = Gtk.Label(label="Timeline", xalign=0, margin_top=8)
+            gantt_lbl.add_css_class("heading")
+            self._content.append(gantt_lbl)
+            project = db_project(self._pid)
+            gantt = GanttChart(self._pid, project, self._win)
+            self._content.append(gantt)
+
+    def _toggle_done(self, gid, done):
+        status = "done" if done else "active"
         with get_db() as c:
-            row = c.execute("SELECT done FROM goal WHERE id=?", (gid,)).fetchone()
-            c.execute("UPDATE goal SET done=? WHERE id=?", (0 if row["done"] else 1, gid))
-        GLib.idle_add(self._refresh)
+            c.execute("UPDATE goal SET done=?, status=? WHERE id=?", (int(done), status, gid))
+        self._refresh()
 
     def _delete(self, gid):
         with get_db() as c:
             c.execute("DELETE FROM goal WHERE id=?", (gid,))
-        GLib.idle_add(self._refresh)
-
-    def _add(self, raw):
-        if not raw: return
-        text, tags = parse_tags_from_text(raw)
-        with get_db() as c:
-            c.execute("INSERT INTO goal (project_id,text,tags) VALUES (?,?,?)",
-                      (self._pid, text, tags))
-        GLib.idle_add(self._refresh)
-
-
-class GoalDetailView(Gtk.Box):
-    """Full detail page for a single goal — editable fields + sub-task list."""
-    def __init__(self, goal_id, pid, win, on_save=None):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                         margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        self._gid = goal_id; self._pid = pid; self._win = win; self._on_save = on_save
-        self._build()
-
-    def _build(self):
-        with get_db() as c:
-            g = c.execute("SELECT * FROM goal WHERE id=?", (self._gid,)).fetchone()
-        if not g:
-            self.append(Gtk.Label(label="Goal not found"))
-            return
-
-        # ── Goal fields ─────────────────────────────────────
-        fields = Adw.PreferencesGroup(title="Goal")
-
-        self._title_row = Adw.EntryRow(title="Title")
-        self._title_row.set_text(g["text"])
-        fields.add(self._title_row)
-
-        self._tags_row = Adw.EntryRow(title="Labels (e.g. #design #personal)")
-        self._tags_row.set_text(safe_col(g, "tags") or "")
-        fields.add(self._tags_row)
-
-        self._due_row = Adw.EntryRow(title="Due date  (+Nd / +Nw / +Nm, optional)")
-        self._due_row.set_text(safe_col(g, "due_date") or "")
-        _wire_date_shortcut(self._due_row)
-        fields.add(self._due_row)
-
-        done_row = Adw.ActionRow(title="Mark as done")
-        self._done_check = Gtk.CheckButton(active=bool(g["done"]))
-        self._done_check.set_valign(Gtk.Align.CENTER)
-        done_row.add_suffix(self._done_check)
-        done_row.set_activatable_widget(self._done_check)
-        fields.add(done_row)
-        self.append(fields)
-
-        save_btn = Gtk.Button(label="Save changes", margin_top=4)
-        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
-        save_btn.connect("clicked", self._save)
-        self.append(save_btn)
-
-        # ── Sub-tasks ─────────────────────────────────────────
-        self._subtask_grp = Adw.PreferencesGroup(title="Steps / Sub-tasks")
-        self._subtask_entry = Adw.EntryRow(title="New step — press Enter to add")
-        self._subtask_entry.connect("entry-activated",
-            lambda r: self._add_subtask(r.get_text().strip()) or r.set_text(""))
-        self._subtask_grp.add(self._subtask_entry)
-        self.append(self._subtask_grp)
-        self._rebuild_subtasks()
-
-    def _rebuild_subtasks(self):
-        # Remove all rows except the entry row (which is first)
-        child = self._subtask_grp.get_first_child()
-        # We need to rebuild by clearing and re-adding everything
-        # Easier: track subtask rows and remove them
-        for sid, row in list(getattr(self, "_subtask_rows", {}).items()):
-            try:
-                self._subtask_grp.remove(row)
-            except Exception:
-                pass
-        self._subtask_rows = {}
-
-        subtasks = db_goal_todos(self._gid)
-        if not subtasks:
-            empty = Adw.ActionRow(title="No steps yet — add one below")
-            empty.add_css_class("dim-label")
-            self._subtask_grp.add(empty)
-            self._subtask_rows[-1] = empty
-        for st in subtasks:
-            row = Adw.ActionRow(title=st["text"])
-            if st["done"]:
-                row.add_css_class("dim-label")
-            check = Gtk.CheckButton(active=bool(st["done"]))
-            check.set_valign(Gtk.Align.CENTER)
-            stid = st["id"]
-            check.connect("toggled", lambda b, i=stid: self._toggle_subtask(i))
-            row.add_prefix(check)
-            row.set_activatable_widget(check)
-            del_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
-            del_btn.set_valign(Gtk.Align.CENTER)
-            del_btn.connect("clicked", lambda _, i=stid: self._delete_subtask(i))
-            row.add_suffix(del_btn)
-            self._subtask_grp.add(row)
-            self._subtask_rows[stid] = row
-
-    def _save(self, _):
-        text = self._title_row.get_text().strip()
-        if not text:
-            return
-        tags    = normalize_tag_input(self._tags_row.get_text())
-        due     = expand_date_shortcut(self._due_row.get_text().strip()) or None
-        done    = 1 if self._done_check.get_active() else 0
-        with get_db() as c:
-            c.execute(
-                "UPDATE goal SET text=?, tags=?, due_date=?, done=? WHERE id=?",
-                (text, tags, due, done, self._gid),
-            )
-        if self._on_save:
-            self._on_save()
-
-    def _add_subtask(self, text):
-        if not text:
-            return
-        with get_db() as c:
-            c.execute("INSERT INTO goal_todo (goal_id, text) VALUES (?,?)", (self._gid, text))
-        self._rebuild_subtasks()
-
-    def _toggle_subtask(self, stid):
-        with get_db() as c:
-            row = c.execute("SELECT done FROM goal_todo WHERE id=?", (stid,)).fetchone()
-            c.execute("UPDATE goal_todo SET done=? WHERE id=?", (0 if row["done"] else 1, stid))
-        GLib.idle_add(self._rebuild_subtasks)
-
-    def _delete_subtask(self, stid):
-        with get_db() as c:
-            c.execute("DELETE FROM goal_todo WHERE id=?", (stid,))
-        GLib.idle_add(self._rebuild_subtasks)
-
-
-class WritingView(Gtk.Box):
-    def __init__(self, pid, win, push_fn=None):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                         margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
-        self._pid = pid; self._win = win; self._push_fn = push_fn
-
-        tb = tip_banner("writing",
-            "Press + to open the full-page editor. Switch to HTML mode for blog-ready formatting. "
-            "Word counts roll up into your Weekly Review digest.")
-        if tb: self.append(tb)
-
-        sc = Gtk.ShortcutController()
-        sc.set_scope(Gtk.ShortcutScope.MANAGED)
-        sc.add_shortcut(Gtk.Shortcut.new(
-            Gtk.KeyvalTrigger.new(Gdk.KEY_n, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: (self._open_entry(), True)[1]),
-        ))
-        self.add_controller(sc)
-
-        self._build()
-
-    def _open_entry(self, entry=None):
-        if self._push_fn:
-            title = entry["title"] if entry else "New Entry"
-            self._push_fn(title, WritingEntryView(self._pid, self._win, entry=entry, on_save=self._refresh))
-
-    def _build(self):
-        entries = db_entries(self._pid)
-        total_wc = sum(len((e["content"] or "").split()) for e in entries if e.get("content"))
-        title_str = f"Writing log  ({total_wc:,} words)" if total_wc else "Writing log"
-        grp = Adw.PreferencesGroup(title=title_str)
-        add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.add_css_class("flat")
-        add_btn.connect("clicked", lambda _: self._open_entry())
-        grp.set_header_suffix(add_btn)
-        if not entries:
-            grp.add(Adw.ActionRow(title="No entries yet — press + to add one"))
-        for e in entries:
-            tags    = get_tags(safe_col(e, "tags"))
-            wc      = len((e["content"] or "").split()) if e.get("content") else 0
-            fmt     = safe_col(e, "content_format") or "plain"
-            sub     = f"{e['date']}  ·  {e['status']}  ·  {wc:,} words"
-            if fmt == "html":
-                sub += "  ·  HTML"
-            if tags:
-                sub += "  " + "  ".join(f"#{t}" for t in tags)
-            row = Adw.ActionRow(title=e["title"], subtitle=sub)
-            row.set_activatable(True)
-            e_snap = dict(e)
-            row.connect("activated", lambda _, ent=e_snap: self._open_entry(ent))
-            add_dblclick(row, lambda ent=e_snap: self._open_entry(ent))
-            db_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            db_btn.add_css_class("flat"); db_btn.add_css_class("destructive-action")
-            db_btn.set_valign(Gtk.Align.CENTER)
-            db_btn.connect("clicked", lambda _, eid=e["id"]: self._delete(eid))
-            row.add_suffix(db_btn)
-            grp.add(row)
-        self.append(grp)
-
-    def _refresh(self):
-        clear_box(self); self._build()
-
-    def _delete(self, eid):
-        with get_db() as c:
-            c.execute("DELETE FROM writing_entry WHERE id=?", (eid,))
-        GLib.idle_add(self._refresh)
-
-
-class WritingEntryView(Gtk.Box):
-    """Full-page writing view — comfortable long-form editor with optional HTML mode."""
-    FORMATS = ["Plain text", "HTML"]
-
-    def __init__(self, pid, win, entry=None, on_save=None):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self._pid = pid; self._win = win; self._entry = entry; self._on_save = on_save
-        self._html_mode = (safe_col(entry, "content_format") == "html") if entry else False
-        self._build()
-
-    def _build(self):
-        # ── Metadata bar (compact) ──────────────────────────
-        meta = Adw.PreferencesGroup(margin_top=12, margin_start=18, margin_end=18)
-
-        self._title_row = Adw.EntryRow(title="Title")
-        if self._entry:
-            self._title_row.set_text(self._entry["title"])
-        meta.add(self._title_row)
-
-        self._date_row = Adw.EntryRow(title="Date  (+Nd / +Nw / +Nm)")
-        self._date_row.set_text(
-            self._entry["date"] if self._entry else date.today().isoformat())
-        _wire_date_shortcut(self._date_row)
-        meta.add(self._date_row)
-
-        status_row = Adw.ActionRow(title="Status")
-        self._status = Gtk.DropDown.new_from_strings(ENTRY_STATUSES)
-        self._status.set_valign(Gtk.Align.CENTER)
-        if self._entry and self._entry["status"] in ENTRY_STATUSES:
-            self._status.set_selected(ENTRY_STATUSES.index(self._entry["status"]))
-        status_row.add_suffix(self._status)
-        meta.add(status_row)
-
-        self._tags_row = Adw.EntryRow(title="Labels")
-        self._tags_row.set_text(safe_col(self._entry, "tags") if self._entry else "")
-        meta.add(self._tags_row)
-
-        fmt_row = Adw.ActionRow(title="Format")
-        fmt_row.set_subtitle("HTML mode: write raw HTML for blog/web publishing")
-        self._fmt_drop = Gtk.DropDown.new_from_strings(self.FORMATS)
-        self._fmt_drop.set_valign(Gtk.Align.CENTER)
-        self._fmt_drop.set_selected(1 if self._html_mode else 0)
-        self._fmt_drop.connect("notify::selected", self._on_fmt_changed)
-        fmt_row.add_suffix(self._fmt_drop)
-        meta.add(fmt_row)
-
-        self.append(meta)
-
-        # ── HTML hint banner ──────────────────────────────────
-        self._html_hint = Gtk.Label(
-            label="HTML mode — write raw HTML tags. Content will be saved as-is.",
-            xalign=0, margin_start=18, margin_end=18, margin_top=6)
-        self._html_hint.add_css_class("caption"); self._html_hint.add_css_class("accent")
-        self._html_hint.set_visible(self._html_mode)
-        self.append(self._html_hint)
-
-        # ── Main writing area ─────────────────────────────────
-        scroll = Gtk.ScrolledWindow(vexpand=True, margin_top=8,
-                                    margin_start=18, margin_end=18, margin_bottom=12)
-        scroll.add_css_class("card")
-        self._text = Gtk.TextView(
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
-            top_margin=16, bottom_margin=16,
-            left_margin=20, right_margin=20,
-            pixels_above_lines=2, pixels_below_lines=2,
-        )
-        font_map = self._text.get_pango_context().get_font_map()
-        self._text.set_monospace(self._html_mode)
-        if self._entry and self._entry["content"]:
-            self._text.get_buffer().set_text(self._entry["content"])
-        scroll.set_child(self._text)
-        self.append(scroll)
-
-        # ── Save button ───────────────────────────────────────
-        save_btn = Gtk.Button(label="Save", margin_start=18, margin_end=18, margin_bottom=12)
-        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
-        save_btn.connect("clicked", self._save)
-        self.append(save_btn)
-
-    def _on_fmt_changed(self, drop, _):
-        self._html_mode = (drop.get_selected() == 1)
-        self._html_hint.set_visible(self._html_mode)
-        self._text.set_monospace(self._html_mode)
-
-    def _save(self, _):
-        title = self._title_row.get_text().strip()
-        d     = self._date_row.get_text().strip()
-        if not title or not d:
-            return
-        try:
-            datetime.strptime(d, "%Y-%m-%d")
-        except ValueError:
-            return
-        status = ENTRY_STATUSES[self._status.get_selected()]
-        tags   = normalize_tag_input(self._tags_row.get_text())
-        fmt    = "html" if self._html_mode else "plain"
-        buf    = self._text.get_buffer()
-        content = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True) or None
-        with get_db() as c:
-            if self._entry:
-                c.execute(
-                    "UPDATE writing_entry SET title=?,content=?,status=?,date=?,tags=?,content_format=? WHERE id=?",
-                    (title, content, status, d, tags, fmt, self._entry["id"]),
-                )
-            else:
-                c.execute(
-                    "INSERT INTO writing_entry (project_id,title,content,status,date,tags,content_format) VALUES (?,?,?,?,?,?,?)",
-                    (self._pid, title, content, status, d, tags, fmt),
-                )
-        if self._on_save:
-            self._on_save()
+        self._refresh()
 
 
 class TagsView(Gtk.Box):
@@ -3418,8 +2314,8 @@ class TagsView(Gtk.Box):
         self._build()
 
     _KIND_LABEL = {
-        "Task": "accent", "Goal": "success", "Milestone": "warning",
-        "Entry": "dim-label", "Note": "dim-label", "File": "dim-label",
+        "Task": "accent", "Goal": "success",
+        "Note": "dim-label", "File": "dim-label",
     }
 
     def _build(self):
@@ -3441,7 +2337,7 @@ class TagsView(Gtk.Box):
         if not tag_data:
             summary_grp.add(Adw.ActionRow(
                 title="No labels yet",
-                subtitle="Add #tags to tasks, goals, milestones, entries, notes, or files",
+                subtitle="Add #tags to tasks, goals, notes, or files",
             ))
         else:
             for tag, data in sorted(tag_data.items(), key=lambda x: -x[1]["total"]):
@@ -3601,36 +2497,132 @@ class AllPinnedNotesView(Gtk.Box):
             self.append(grp)
 
 
+class NoteEditView(Gtk.Box):
+    """Full-screen note editor pushed onto the navigation stack."""
+    def __init__(self, pid, win, note=None, on_save=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._pid = pid; self._win = win; self._note = note; self._on_save = on_save
+
+        toolbar = Gtk.Box(spacing=8,
+                          margin_top=8, margin_bottom=8,
+                          margin_start=12, margin_end=12)
+
+        pin_icon = "starred-symbolic" if (note and note.get("pinned")) else "non-starred-symbolic"
+        self._pin_btn = Gtk.ToggleButton(icon_name=pin_icon, active=bool(note and note.get("pinned")))
+        self._pin_btn.add_css_class("flat")
+        self._pin_btn.set_tooltip_text("Pin to dashboard")
+        toolbar.append(self._pin_btn)
+
+        self._tags_entry = Gtk.Entry(placeholder_text="Labels (e.g. #idea #todo)",
+                                     hexpand=True)
+        self._tags_entry.set_text(safe_col(note, "tags") if note else "")
+        toolbar.append(self._tags_entry)
+
+        save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", self._save)
+        toolbar.append(save_btn)
+
+        self.append(toolbar)
+
+        sep = Gtk.Separator()
+        self.append(sep)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        self._tv = Gtk.TextView(vexpand=True, hexpand=True,
+                                top_margin=12, bottom_margin=12,
+                                left_margin=18, right_margin=18,
+                                wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self._tv.add_css_class("monospace")
+        if note:
+            self._tv.get_buffer().set_text(note["content"])
+        scroll.set_child(self._tv)
+        self.append(scroll)
+
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.MANAGED)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: self._save(None) or True),
+        ))
+        self.add_controller(sc)
+
+    def _save(self, _):
+        buf = self._tv.get_buffer()
+        content = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        if not content.strip(): return
+        tags    = normalize_tag_input(self._tags_entry.get_text())
+        pinned  = 1 if self._pin_btn.get_active() else 0
+        today   = date.today().isoformat()
+        with get_db() as c:
+            if self._note:
+                c.execute(
+                    "UPDATE note SET content=?,tags=?,pinned=? WHERE id=?",
+                    (content, tags, pinned, self._note["id"]),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO note (project_id,content,tags,pinned,created_date) VALUES (?,?,?,?,?)",
+                    (self._pid, content, tags, pinned, today),
+                )
+        if self._on_save: self._on_save()
+
+
 class NotesView(Gtk.Box):
-    def __init__(self, pid, win):
+    def __init__(self, pid, win, push_fn=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
-        self._pid = pid; self._win = win
+        self._pid = pid; self._win = win; self._push_fn = push_fn
+
         sc = Gtk.ShortcutController()
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
         sc.add_shortcut(Gtk.Shortcut.new(
             Gtk.KeyvalTrigger.new(Gdk.KEY_n, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: (
-                NoteDialog(self._win, self._pid, on_save=self._refresh).present(), True)[1]),
+            Gtk.CallbackAction.new(lambda *_: self._open_new() or True),
         ))
         self.add_controller(sc)
-        self._build()
 
-    def _build(self):
+        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.append(self._content)
+        self._refresh()
+
+    def _open_new(self):
+        if self._push_fn:
+            view = NoteEditView(self._pid, self._win, on_save=self._refresh)
+            self._push_fn("New Note", view)
+        else:
+            NoteDialog(self._win, self._pid, on_save=self._refresh).present()
+
+    def _open_edit(self, note):
+        if self._push_fn:
+            view = NoteEditView(self._pid, self._win, note=note, on_save=self._refresh)
+            self._push_fn(note["content"][:30].replace("\n", " "), view)
+        else:
+            NoteDialog(self._win, self._pid, note=note, on_save=self._refresh).present()
+
+    def _refresh(self):
+        clear_box(self._content)
         notes = db_notes(self._pid)
         grp = Adw.PreferencesGroup(title="Notes")
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
         add_btn.add_css_class("flat")
-        add_btn.connect("clicked", lambda _: NoteDialog(self._win, self._pid, on_save=self._refresh).present())
+        add_btn.connect("clicked", lambda _: self._open_new())
         grp.set_header_suffix(add_btn)
         if not notes:
-            grp.add(Adw.ActionRow(title="No notes yet — press + to jot one down"))
+            grp.add(Adw.ActionRow(title="No notes yet — press + or Ctrl+N to add one"))
         for n in notes:
             snippet = n["content"][:80].replace("\n", " ")
-            if len(n["content"]) > 80:
-                snippet += "…"
-            row = Adw.ActionRow(title=snippet, subtitle=n["created_date"])
+            if len(n["content"]) > 80: snippet += "…"
+            tags = get_tags(safe_col(n, "tags"))
+            sub_parts = [n["created_date"]]
+            if tags: sub_parts.append("  ".join(f"#{t}" for t in tags))
+            row = Adw.ActionRow(title=snippet, subtitle="  ·  ".join(sub_parts))
             row.set_title_lines(2)
+
+            if n["pinned"]:
+                star = Gtk.Image(icon_name="starred-symbolic")
+                star.add_css_class("accent"); star.set_valign(Gtk.Align.CENTER)
+                row.add_prefix(star)
 
             pin_icon = "starred-symbolic" if n["pinned"] else "non-starred-symbolic"
             pin_btn = Gtk.Button(icon_name=pin_icon)
@@ -3643,8 +2635,8 @@ class NotesView(Gtk.Box):
             n_snap = dict(n)
             eb = Gtk.Button(icon_name="document-edit-symbolic")
             eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
-            eb.connect("clicked", lambda _, nt=n_snap: NoteDialog(self._win, self._pid, note=nt, on_save=self._refresh).present())
-            add_dblclick(row, lambda nt=n_snap: NoteDialog(self._win, self._pid, note=nt, on_save=self._refresh).present())
+            eb.connect("clicked", lambda _, nt=n_snap: self._open_edit(nt))
+            add_dblclick(row, lambda nt=n_snap: self._open_edit(nt))
 
             db_btn = Gtk.Button(icon_name="user-trash-symbolic")
             db_btn.add_css_class("flat"); db_btn.add_css_class("destructive-action")
@@ -3653,20 +2645,17 @@ class NotesView(Gtk.Box):
 
             row.add_suffix(pin_btn); row.add_suffix(eb); row.add_suffix(db_btn)
             grp.add(row)
-        self.append(grp)
-
-    def _refresh(self):
-        clear_box(self); self._build()
+        self._content.append(grp)
 
     def _toggle_pin(self, nid, currently_pinned):
         with get_db() as c:
             c.execute("UPDATE note SET pinned=? WHERE id=?", (0 if currently_pinned else 1, nid))
-        GLib.idle_add(self._refresh)
+        self._refresh()
 
     def _delete(self, nid):
         with get_db() as c:
             c.execute("DELETE FROM note WHERE id=?", (nid,))
-        GLib.idle_add(self._refresh)
+        self._refresh()
 
 
 class FilesView(Gtk.Box):
@@ -3808,11 +2797,14 @@ class AllTasksGoalsView(Gtk.Box):
                 row.set_use_markup(True)
                 grp.add(row)
             for g in undone_g:
-                row = Adw.ActionRow(title=GLib.markup_escape_text(g["text"]), subtitle="Goal")
+                row = Adw.ActionRow(title=GLib.markup_escape_text(g["text"]))
                 row.set_use_markup(True)
-                due = safe_col(g, "due_date")
-                if due:
-                    row.set_subtitle(f"Goal  ·  due {due}")
+                status   = safe_col(g, "status") or "pending"
+                end_date = safe_col(g, "end_date") or safe_col(g, "due_date") or ""
+                sub = f"Goal  ·  {status}"
+                if end_date:
+                    sub += f"  ·  due {end_date}"
+                row.set_subtitle(sub)
                 grp.add(row)
             open_btn = Gtk.Button(label="Open project")
             open_btn.add_css_class("flat")
@@ -3879,7 +2871,7 @@ class AllFilesView(Gtk.Box):
 
 
 class ComingUpView(Gtk.Box):
-    """All upcoming milestones + goals with due dates across all projects."""
+    """All upcoming goals and tasks with end/due dates across all projects."""
     def __init__(self, win):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                          margin_top=12, margin_bottom=24,
@@ -3893,7 +2885,7 @@ class ComingUpView(Gtk.Box):
         if not items:
             sp = Adw.StatusPage(
                 title="Nothing due in the next 90 days",
-                description="Add milestones or goal deadlines to see them here",
+                description="Add goal end dates or task due dates to see them here",
                 icon_name="alarm-symbolic",
             )
             sp.set_vexpand(True)
@@ -3922,25 +2914,13 @@ class ComingUpView(Gtk.Box):
                           "tomorrow" if days_left == 1 else f"{days_left}d")
 
             row = Adw.ActionRow(title=it["title"])
-            is_ms = (it["kind"] == "Milestone")
             row.set_subtitle(f"{it['kind']}  ·  {it['project_name']}")
             row.set_activatable(True)
 
-            dot = color_dot(it["project_color"] or "#4fa8c4", size=10)
+            dot = color_dot(it.get("project_color") or "#4fa8c4", size=10)
             dot.set_valign(Gtk.Align.CENTER)
             row.add_prefix(dot)
-
-            if is_ms:
-                mid  = it["id"]; pid = it["project_id"]
-                def _open_ms_edit(mid=mid, pid=pid):
-                    with get_db() as c:
-                        ms = c.execute("SELECT * FROM milestone WHERE id=?", (mid,)).fetchone()
-                    if ms:
-                        MilestoneDialog(self._win, pid, milestone=dict(ms),
-                                        on_save=self._build).present()
-                row.connect("activated", lambda _, f=_open_ms_edit: f())
-            else:
-                row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
+            row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
 
             ul = Gtk.Label(label=urgency_tx)
             ul.add_css_class("caption")
@@ -3959,15 +2939,6 @@ class HomeView(Gtk.Box):
                          margin_top=12, margin_bottom=24,
                          margin_start=18, margin_end=18)
         self._win = win
-
-        today = date.today()
-        self._year_opts = (
-            ["All", "3 months", "6 months"] +
-            [str(y) for y in range(today.year - 1, today.year + 9)]
-        )
-        self._year_drop = Gtk.DropDown.new_from_strings(self._year_opts)
-        self._year_drop.set_selected(4)   # current year
-        self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild_gantt))
 
         self._build()
 
@@ -4021,8 +2992,8 @@ class HomeView(Gtk.Box):
 
         # ── Homepage tip ──────────────────────────────
         tb = tip_banner("homepage",
-            "Click Overall progress to see all tasks across every project. "
-            "The ● health dot turns red when a milestone is overdue. "
+            "Click Overall progress to see all tasks and goals across every project. "
+            "The ● health dot turns yellow/red when goals or tasks need attention. "
             "Press + on any project row to add a task without opening it.")
         if tb: self.append(tb)
 
@@ -4080,14 +3051,11 @@ class HomeView(Gtk.Box):
             pct   = done / total if total else 0
             left  = total - done
             p_emoji = safe_col(p, "emoji") or suggest_emoji(p["name"])
-            streak  = compute_streak(p["id"])
             health_color, health_reason = project_health(p["id"])
             row = Adw.ActionRow(title=f"{p_emoji}  {p['name']}")
             sub_parts = [p["status"]]
             if total:
                 sub_parts.append(f"{left} left · {done} done" if left else f"All {total} done ✓")
-            if streak >= 2:
-                sub_parts.append(f"🔥 {streak}-day streak")
             row.set_subtitle("  ·  ".join(sub_parts))
             dot = color_dot(p["color"], size=12)
             dot.set_valign(Gtk.Align.CENTER)
@@ -4150,24 +3118,12 @@ class HomeView(Gtk.Box):
             proj_grp.add(_make_proj_row(p))
         self.append(proj_grp)
 
-        # ── Due soon (milestones + goals) ─────────────
-        due_ms  = db_due_soon(14)
-        due_gs  = db_goals_due_soon(14)
-        due_all = (
-            [{"id": m["id"], "title": m["title"], "end_date": m["end_date"],
-              "project_name": m["project_name"], "project_id": m["project_id"],
-              "project_color": safe_col(m, "project_color") or "#4fa8c4",
-              "kind": "Milestone"} for m in due_ms] +
-            [{"id": None, "title": g["text"], "end_date": safe_col(g, "due_date"),
-              "project_name": g["project_name"], "project_id": g["project_id"],
-              "project_color": safe_col(g, "project_color") or "#4fa8c4",
-              "kind": "Goal"} for g in due_gs]
-        )
-        due_all.sort(key=lambda x: x["end_date"] or "")
-        if due_all:
+        # ── Due in the next 14 days (goals + tasks) ───
+        due_items = db_coming_up(14)
+        if due_items:
             due_grp = Adw.PreferencesGroup(title="Due in the next 14 days")
-            for item in due_all:
-                end_date  = item["end_date"]
+            for it in due_items:
+                end_date = it["end_date"]
                 try:
                     days_left = (datetime.strptime(end_date, "%Y-%m-%d").date() - date.today()).days
                 except ValueError:
@@ -4175,43 +3131,26 @@ class HomeView(Gtk.Box):
                 urgency_cl = "error" if days_left <= 2 else ("warning" if days_left <= 7 else "dim-label")
                 urgency_tx = ("today!" if days_left == 0 else
                               "tomorrow" if days_left == 1 else f"{days_left}d left")
-
-                is_ms = (item["kind"] == "Milestone")
-                row = Adw.ActionRow(title=item["title"])
-                hint = "  ·  Double-click to edit" if is_ms else ""
-                row.set_subtitle(f"{item['project_name']}  ·  {item['kind']}  ·  ends {end_date}{hint}")
-
-                dot = color_dot(item["project_color"], size=10)
+                row = Adw.ActionRow(title=it["title"])
+                row.set_subtitle(f"{it['kind']}  ·  {it['project_name']}  ·  {end_date}")
+                dot = color_dot(it.get("project_color") or "#4fa8c4", size=10)
                 dot.set_valign(Gtk.Align.CENTER)
                 row.add_prefix(dot)
-
                 row.set_activatable(True)
-                if is_ms:
-                    mid = item["id"]; pid_ms = item["project_id"]
-                    def _open_ms_dialog(mid=mid, pid_ms=pid_ms):
-                        with get_db() as c:
-                            ms = c.execute("SELECT * FROM milestone WHERE id=?", (mid,)).fetchone()
-                        if ms:
-                            MilestoneDialog(self._win, pid_ms, milestone=dict(ms),
-                                            on_save=self._win.show_home).present()
-                    row.connect("activated", lambda _, f=_open_ms_dialog: f())
-                else:
-                    row.connect("activated", lambda _, pid=item["project_id"]: self._win._open_project(pid))
-
+                row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
                 ul = Gtk.Label(label=urgency_tx)
-                ul.add_css_class("caption")
-                ul.add_css_class(urgency_cl)
+                ul.add_css_class("caption"); ul.add_css_class(urgency_cl)
                 ul.set_valign(Gtk.Align.CENTER)
                 row.add_suffix(ul)
                 due_grp.add(row)
             self.append(due_grp)
 
-        # ── Coming up soon (15–60 days) ───────────────
-        future = [it for it in db_coming_up(60)
+        # ── Coming up soon (15–90 days) ───────────────
+        future = [it for it in db_coming_up(90)
                   if it["end_date"] > (date.today() + timedelta(days=14)).isoformat()]
         if future:
             preview = future[:4]
-            cu_grp = Adw.PreferencesGroup(title=f"Coming up  ({len(future)} item{'s' if len(future)!=1 else ''} in the next 60 days)")
+            cu_grp = Adw.PreferencesGroup(title=f"Coming up  ({len(future)} item{'s' if len(future)!=1 else ''} in next 90 days)")
             see_all_btn = Gtk.Button(label="See all")
             see_all_btn.add_css_class("flat")
             see_all_btn.connect("clicked", lambda _: self._win.show_coming_up())
@@ -4222,24 +3161,13 @@ class HomeView(Gtk.Box):
                     dl = (datetime.strptime(end_date, "%Y-%m-%d").date() - date.today()).days
                 except ValueError:
                     continue
-                is_ms = (it["kind"] == "Milestone")
                 row = Adw.ActionRow(title=it["title"])
                 row.set_subtitle(f"{it['kind']}  ·  {it['project_name']}  ·  {end_date}")
-                dot = color_dot(it["project_color"] or "#4fa8c4", size=10)
+                dot = color_dot(it.get("project_color") or "#4fa8c4", size=10)
                 dot.set_valign(Gtk.Align.CENTER)
                 row.add_prefix(dot)
                 row.set_activatable(True)
-                if is_ms:
-                    mid = it["id"]; pid_ms = it["project_id"]
-                    def _open_ms_dlg(mid=mid, pid_ms=pid_ms):
-                        with get_db() as c:
-                            ms = c.execute("SELECT * FROM milestone WHERE id=?", (mid,)).fetchone()
-                        if ms:
-                            MilestoneDialog(self._win, pid_ms, milestone=dict(ms),
-                                            on_save=self._win.show_home).present()
-                    row.connect("activated", lambda _, f=_open_ms_dlg: f())
-                else:
-                    row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
+                row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
                 dl_lbl = Gtk.Label(label=f"{dl}d")
                 dl_lbl.add_css_class("caption"); dl_lbl.add_css_class("dim-label")
                 dl_lbl.set_valign(Gtk.Align.CENTER)
@@ -4247,78 +3175,11 @@ class HomeView(Gtk.Box):
                 cu_grp.add(row)
             self.append(cu_grp)
 
-        # ── Activity heatmap ──────────────────────────
-        heat_grp = Adw.PreferencesGroup(title="Activity — past 26 weeks")
-        heat_row = Adw.ActionRow()
-        heat_row.set_activatable(False)
-        heatmap = make_heatmap(26)
-        heatmap.set_margin_top(8); heatmap.set_margin_bottom(8)
-        heat_row.set_child(heatmap)
-        heat_grp.add(heat_row)
-        self.append(heat_grp)
-
-        # ── Multi-project Gantt ───────────────────────
-        gantt_hdr = Gtk.Box(spacing=10, margin_top=8, margin_bottom=2)
-        gantt_hdr.append(Gtk.Label(label="Milestones:"))
-        gantt_hdr.append(self._year_drop)
-        self.append(gantt_hdr)
-
-        self._gantt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.append(self._gantt_box)
-        self._rebuild_gantt()
-
-    # ── Gantt helpers ──────────────────────────────────
-
-    def _view_range(self):
-        opt = self._year_opts[self._year_drop.get_selected()]
-        if opt == "All":
-            return None, None
-        today_dt = date.today()
-        start = datetime(today_dt.year, today_dt.month, today_dt.day)
-        if opt == "3 months":
-            return start, _months_later(start, 3)
-        if opt == "6 months":
-            return start, _months_later(start, 6)
-        y = int(opt)
-        return datetime(y, 1, 1), datetime(y, 12, 31)
-
-    def _rebuild_gantt(self):
-        clear_box(self._gantt_box)
-        rows = db_all_milestones_with_project()
-        if not rows:
-            lbl = Gtk.Label(label="No milestones yet")
-            lbl.add_css_class("dim-label")
-            self._gantt_box.append(lbl)
-            return
-
-        vstart, vend = self._view_range()
-
-        # Convert to dicts so we can attach _project_color
-        ms = []
-        for m in rows:
-            d = {k: m[k] for k in m.keys()}
-            d["_project_color"] = d.get("project_color") or "#4fa8c4"
-            d["title"] = f"{d['project_name']}: {d['title']}"
-            ms.append(d)
-
-        if vstart:
-            def in_range(m):
-                try:
-                    s = datetime.strptime(m["start_date"], "%Y-%m-%d")
-                    e = datetime.strptime(m["end_date"],   "%Y-%m-%d")
-                    return e >= vstart and s <= vend
-                except ValueError:
-                    return False
-            chart_ms = [m for m in ms if in_range(m)]
-        else:
-            chart_ms = ms
-
-        if chart_ms:
-            self._gantt_box.append(GanttChart(chart_ms, "#4fa8c4", vstart, vend))
-        else:
-            lbl = Gtk.Label(label="No milestones in this period")
-            lbl.add_css_class("dim-label")
-            self._gantt_box.append(lbl)
+        # ── Multi-project Goals Gantt ─────────────────
+        gantt_lbl = Gtk.Label(label="All Goals — Timeline", xalign=0, margin_top=8)
+        gantt_lbl.add_css_class("heading")
+        self.append(gantt_lbl)
+        self.append(GanttChart(None, None, self._win))
 
     def _refresh(self):
         """Rebuild home view in-place (called after quick task add)."""
@@ -4487,12 +3348,6 @@ class ProjectDetailView(Gtk.Box):
         export_btn.connect("clicked", self._do_export)
         hdr.pack_end(export_btn)
 
-        # Save as template button
-        tmpl_save_btn = Gtk.Button(icon_name="document-save-symbolic")
-        tmpl_save_btn.add_css_class("flat"); tmpl_save_btn.set_tooltip_text("Save as project template")
-        tmpl_save_btn.connect("clicked", self._save_as_template)
-        hdr.pack_end(tmpl_save_btn)
-
         # Pomodoro toggle (controls the global timer in MainWindow)
         pomo_hdr_btn = Gtk.Button(icon_name="clock-symbolic")
         pomo_hdr_btn.add_css_class("flat")
@@ -4539,15 +3394,10 @@ class ProjectDetailView(Gtk.Box):
 
         todos  = db_todos(pid)
         done_t = sum(1 for t in todos if t["done"])
-        ms     = db_milestones(pid)
         goals  = db_goals(pid)
         done_g = sum(1 for g in goals if g["done"])
         notes  = db_notes(pid)
-        entries = db_entries(pid)
         files  = db_files(pid)
-
-        left_t  = len(todos) - done_t   # undone todos
-        left_g  = len(goals) - done_g
 
         def sub(count, label, done=None):
             if count == 0:
@@ -4562,16 +3412,10 @@ class ProjectDetailView(Gtk.Box):
         for it in all_tagged_items(pid):
             tag_set.update(get_tags(it["tags"]))
 
-        streak = compute_streak(pid)
-        streak_s = f"  🔥 {streak}-day streak" if streak >= 2 else ""
-
         sections = [
             ("checkbox-checked-symbolic", "To-do list",
-             sub(len(todos), "tasks", done_t) + streak_s,
+             sub(len(todos), "tasks", done_t),
              self._open_todos),
-            ("appointment-new-symbolic",  "Timeline",
-             sub(len(ms), "milestones"),
-             self._open_timeline),
             ("starred-symbolic",          "Goals",
              sub(len(goals), "goals", done_g),
              self._open_goals),
@@ -4581,9 +3425,6 @@ class ProjectDetailView(Gtk.Box):
             ("document-new-symbolic",     "Notes",
              sub(len(notes), "notes"),
              self._open_notes),
-            ("document-edit-symbolic",    "Writing log",
-             sub(len(entries), "entries"),
-             self._open_writing),
             ("folder-open-symbolic",      "Files",
              sub(len(files), "linked"),
              self._open_files),
@@ -4632,10 +3473,8 @@ class ProjectDetailView(Gtk.Box):
                 prow.set_title_lines(2)
                 prow.set_activatable(True)
                 n_snap = dict(n)
-                prow.connect("activated", lambda _, ns=n_snap:
-                    NoteDialog(self._win, pid, note=ns, on_save=self._rebuild_tiles).present())
-                add_dblclick(prow, lambda ns=n_snap:
-                    NoteDialog(self._win, pid, note=ns, on_save=self._rebuild_tiles).present())
+                prow.connect("activated", lambda _, ns=n_snap: self._open_note_edit(ns))
+                add_dblclick(prow, lambda ns=n_snap: self._open_note_edit(ns))
                 pin_grp.add(prow)
             outer.append(pin_grp)
 
@@ -4693,9 +3532,6 @@ class ProjectDetailView(Gtk.Box):
     def _open_todos(self):
         self._push("To-do list", TodosView(self._pid, self._win))
 
-    def _open_timeline(self):
-        self._push("Timeline", TimelineView(self._pid, self._project, self._win))
-
     def _open_goals(self):
         self._push("Goals", GoalsView(self._pid, self._win, push_fn=self._push))
 
@@ -4703,13 +3539,16 @@ class ProjectDetailView(Gtk.Box):
         self._push("Labels", TagsView(self._pid, self._win))
 
     def _open_notes(self):
-        view = NotesView(self._pid, self._win)
+        view = NotesView(self._pid, self._win, push_fn=self._push)
         self._push("Notes", view,
-                   add_cb=lambda: NoteDialog(self._win, self._pid, on_save=view._refresh).present())
+                   add_cb=lambda: self._push(
+                       "New Note",
+                       NoteEditView(self._pid, self._win, on_save=view._refresh)))
 
-    def _open_writing(self):
-        view = WritingView(self._pid, self._win, push_fn=self._push)
-        self._push("Writing log", view)
+    def _open_note_edit(self, note):
+        self._push(
+            note["content"][:30].replace("\n", " "),
+            NoteEditView(self._pid, self._win, note=note, on_save=self._rebuild_tiles))
 
     def _open_files(self):
         view = FilesView(self._pid, self._win)
@@ -4719,10 +3558,8 @@ class ProjectDetailView(Gtk.Box):
         """Navigate directly into a named section (used by homepage alerts)."""
         dispatch = {
             "tasks":    self._open_todos,
-            "timeline": self._open_timeline,
             "goals":    self._open_goals,
             "notes":    self._open_notes,
-            "writing":  self._open_writing,
         }
         fn = dispatch.get(section)
         if fn:
@@ -4733,7 +3570,6 @@ class ProjectDetailView(Gtk.Box):
     def _save_as_template(self, _):
         p = self._project
         todos = db_todos(self._pid)
-        ms    = db_milestones(self._pid)
         goals = db_goals(self._pid)
         dialog = Adw.Window(title="Save as Template", modal=True,
                             transient_for=self._win, default_width=360, resizable=False)
@@ -4759,19 +3595,6 @@ class ProjectDetailView(Gtk.Box):
                 for g in goals:
                     c.execute("INSERT INTO pt_goal (template_id, text, tags) VALUES (?,?,?)",
                               (tid, g["text"], safe_col(g,"tags") or ""))
-                if ms:
-                    ref_date = min(
-                        datetime.strptime(m["start_date"], "%Y-%m-%d").date() for m in ms
-                    )
-                else:
-                    ref_date = date.today()
-                for m in ms:
-                    ms_start = datetime.strptime(m["start_date"], "%Y-%m-%d").date()
-                    ms_end   = datetime.strptime(m["end_date"],   "%Y-%m-%d").date()
-                    day_off  = (ms_start - ref_date).days
-                    duration = max(1, (ms_end - ms_start).days)
-                    c.execute("INSERT INTO pt_milestone (template_id, title, day_offset, duration_days) VALUES (?,?,?,?)",
-                              (tid, m["title"], day_off, duration))
             dialog.close()
         save_btn = Gtk.Button(label="Save template", margin_top=6)
         save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
@@ -5062,286 +3885,6 @@ class FocusModeView(Gtk.Box):
         GLib.idle_add(self._build)
 
 
-# ══════════════════════════════════════════════════════
-# Weekly Review View
-# ══════════════════════════════════════════════════════
-
-class WeeklyReviewView(Gtk.Box):
-    def __init__(self, win):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                         margin_top=12, margin_bottom=24,
-                         margin_start=18, margin_end=18)
-        self._win = win
-        self._build()
-
-    def _collect(self):
-        today = date.today()
-        week_start = today - timedelta(days=today.weekday())
-        ws = week_start.isoformat(); ts = today.isoformat()
-
-        projects = db_projects()
-        completed_tasks, completed_ms, entries_week = [], [], []
-        words_written = 0
-        for p in projects:
-            for t in db_todos(p["id"]):
-                cd = safe_col(t, "completed_date") or ""
-                if cd and ws <= cd <= ts:
-                    completed_tasks.append((t, p))
-            for m in db_milestones(p["id"]):
-                if safe_col(m, "status") == "done":
-                    ed = m["end_date"] or ""
-                    if ws <= ed <= ts:
-                        completed_ms.append((m, p))
-            for e in db_entries(p["id"]):
-                ed = e["date"] or ""
-                if ws <= ed <= ts:
-                    wc = len((e["content"] or "").split())
-                    words_written += wc
-                    entries_week.append((e, p, wc))
-        streaks = [(p, s) for p in projects for s in [compute_streak(p["id"])] if s >= 2]
-        return week_start, today, completed_tasks, completed_ms, entries_week, words_written, streaks
-
-    def _generate_md(self):
-        week_start, today, tasks, milestones, entries, words, streaks = self._collect()
-        lines = [
-            f"# Weekly Review — {week_start.strftime('%b %d')}–{today.strftime('%b %d, %Y')}",
-            "",
-            "## Stats",
-            f"- {len(tasks)} tasks completed",
-            f"- {len(milestones)} milestones reached",
-            f"- {words:,} words written",
-            f"- {len(streaks)} active streaks",
-            "",
-        ]
-        if tasks:
-            lines += ["## Tasks completed", ""]
-            for t, p in tasks:
-                lines.append(f"- [{p['name']}] {t['text']}")
-            lines.append("")
-        if milestones:
-            lines += ["## Milestones reached", ""]
-            for m, p in milestones:
-                lines.append(f"- [{p['name']}] {m['title']}")
-            lines.append("")
-        if entries:
-            lines += ["## Writing log entries", ""]
-            for e, p, wc in entries:
-                lines.append(f"- [{p['name']}] {e['title']}  ({wc:,} words)")
-            lines.append("")
-        if streaks:
-            lines += ["## Active streaks", ""]
-            for p, s in sorted(streaks, key=lambda x: -x[1]):
-                emoji = safe_col(p, "emoji") or suggest_emoji(p["name"])
-                lines.append(f"- {emoji} {p['name']}  — {s}-day streak")
-        return "\n".join(lines)
-
-    def _export(self, _):
-        content = self._generate_md()
-        today = date.today()
-        fname = f"weekly-review-{today.isoformat()}.md"
-        if hasattr(Gtk, "FileDialog"):
-            dialog = Gtk.FileDialog.new()
-            dialog.set_title("Export weekly review")
-            dialog.set_initial_name(fname)
-            def _saved(d, res):
-                try:
-                    f = d.save_finish(res)
-                    f.replace_contents(content.encode(), None, False,
-                                       Gio.FileCreateFlags.REPLACE_DESTINATION, None)
-                except Exception:
-                    pass
-            dialog.save(self._win, None, _saved)
-        else:
-            import tempfile, subprocess
-            tmp = tempfile.NamedTemporaryFile(suffix=".md", delete=False,
-                                              mode="w", prefix="weekly-review-")
-            tmp.write(content); tmp.close()
-            subprocess.Popen(["xdg-open", tmp.name])
-
-    def _copy(self, _):
-        content = self._generate_md()
-        Gdk.Display.get_default().get_clipboard().set(content)
-
-    def _build(self):
-        clear_box(self)
-        week_start, today, completed_tasks, completed_ms, entries_week, words_written, streaks = self._collect()
-
-        # ── Export row ────────────────────────────────────────
-        btn_box = Gtk.Box(spacing=8, halign=Gtk.Align.END,
-                          margin_bottom=4, margin_end=2)
-        copy_btn = Gtk.Button(label="Copy Markdown")
-        copy_btn.add_css_class("flat")
-        copy_btn.connect("clicked", self._copy)
-        export_btn = Gtk.Button(label="Export .md")
-        export_btn.add_css_class("flat")
-        export_btn.connect("clicked", self._export)
-        btn_box.append(copy_btn); btn_box.append(export_btn)
-        self.append(btn_box)
-
-        # ── Stats strip ───────────────────────────────────────
-        stat_box = Gtk.Box(spacing=0, homogeneous=True,
-                           margin_start=4, margin_end=4, margin_top=4, margin_bottom=4)
-        for val, lbl_txt in [
-            (str(len(completed_tasks)), "tasks done"),
-            (str(len(completed_ms)), "milestones hit"),
-            (f"{words_written:,}", "words written"),
-            (str(len(streaks)), "active streaks"),
-        ]:
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            col.set_halign(Gtk.Align.CENTER)
-            v = Gtk.Label(label=val); v.add_css_class("title-2"); v.add_css_class("accent")
-            l = Gtk.Label(label=lbl_txt); l.add_css_class("caption"); l.add_css_class("dim-label")
-            col.append(v); col.append(l)
-            stat_box.append(col)
-        stat_box.add_css_class("card")
-        self.append(stat_box)
-
-        if completed_tasks:
-            done_grp = Adw.PreferencesGroup(title="Tasks completed this week")
-            for t, p in completed_tasks[:20]:
-                row = Adw.ActionRow(title=t["text"],
-                                    subtitle=f"{p['name']}  ·  {safe_col(t,'completed_date')}")
-                done_grp.add(row)
-            self.append(done_grp)
-
-        if completed_ms:
-            ms_grp = Adw.PreferencesGroup(title="Milestones reached")
-            for m, p in completed_ms:
-                row = Adw.ActionRow(title=m["title"], subtitle=p["name"])
-                ms_grp.add(row)
-            self.append(ms_grp)
-
-        if entries_week:
-            wr_grp = Adw.PreferencesGroup(title="Writing log entries")
-            for e, p, wc in entries_week:
-                row = Adw.ActionRow(title=e["title"],
-                                    subtitle=f"{p['name']}  ·  {wc:,} words")
-                wr_grp.add(row)
-            self.append(wr_grp)
-
-        if streaks:
-            streak_grp = Adw.PreferencesGroup(title="Active streaks")
-            for p, s in sorted(streaks, key=lambda x: -x[1]):
-                emoji = safe_col(p, "emoji") or suggest_emoji(p["name"])
-                row = Adw.ActionRow(title=f"{emoji}  {p['name']}",
-                                    subtitle=f"{s} consecutive days with completed tasks")
-                streak_grp.add(row)
-            self.append(streak_grp)
-
-        if not completed_tasks and not completed_ms and not entries_week:
-            sp = Adw.StatusPage(title="Nothing completed yet this week",
-                                description="Keep going — tasks completed this week will appear here",
-                                icon_name="view-refresh-symbolic")
-            sp.set_vexpand(True); self.append(sp)
-
-
-# ══════════════════════════════════════════════════════
-# Help / Keyboard Shortcuts Dialog
-# ══════════════════════════════════════════════════════
-
-TUTORIAL_TEXT = """\
-PROJEX — QUICK GUIDE
-====================
-
-PAGE NAMES
-----------
-Homepage              The main overview when you open the app
-Project Dashboard     Opens when you click a project in the sidebar
-To-do list            Task list inside a project
-Timeline              Milestones + Gantt chart inside a project
-Upcoming Deadlines    All milestone + goal deadlines in the next 90 days
-All Tasks & Goals     Every undone task and goal across all projects
-All Linked Files      Every file linked across all projects
-Focus Mode            Single-task view — your highest-priority undone task
-Weekly Review         Tasks, milestones, and streaks completed this week
-
-SIDEBAR (LEFT PANEL)
---------------------
-+ (plus)          Create a new project
-Home icon         Return to the Homepage
-! (exclamation)   Open Upcoming Deadlines
-Hourglass         Toggle the Pomodoro timer (25 min work / 5 min break)
-(hamburger menu)  Tools & settings:
-  Sun/Moon          Toggle dark / light mode
-  Focus Mode        Open Focus Mode
-  Weekly Review     Open the Weekly Review
-  Project Templates Browse and apply project templates
-  Help & Shortcuts  This dialog
-
-HOMEPAGE
---------
-Overall progress  Click to open All Tasks & Goals (every undone task)
-All linked files  Click to open All Linked Files
-Health dot (●)    Green = on track · Yellow = stalled · Red = overdue milestones
-+ button on row   Quick-add a task to that project without opening it
-Gantt chart       Overview of all milestone timelines; titles are left-justified
-
-UPCOMING DEADLINES PAGE
------------------------
-Rows show milestones and goal due dates grouped by month
-Click a row       Open the project that owns this deadline
-Edit button       Edit a milestone's details directly from this page
-Double-click row  Same as edit button (milestones only)
-
-PROJECT DASHBOARD
------------------
-Click a tile      Open that section (To-do list, Timeline, Goals, etc.)
-Edit (pencil)     Edit project name, status, description, color, emoji
-Save icon         Save this project as a reusable project template
-Export (share)    Export the project as a Markdown report
-Pomodoro (clock)  Toggle the Pomodoro timer (same global timer as sidebar)
-Trash             Delete project — always asks for confirmation first
-Grid/List toggle  Switch the dashboard between tile grid and compact list view
-
-PINNED NOTES PINBOARD
----------------------
-Appears below the dashboard tiles when any note is pinned (starred)
-Click a note row  Open the note editor
-"See all notes"   Navigate to the full Notes section
-
-TO-DO LIST
-----------
-Add task area     Three fields: task name, labels, repeat interval — press Enter
-Drag handle       Reorder active tasks by dragging
-Checkbox          Mark task done / undone (done tasks collapse into a disclosure)
-Priority bar      Red left edge = high priority · Blue = low priority
-Shuffle button    "Pick a task for me" — shows a random undone task in a banner
-Select            Toggle bulk-select mode; checkbox appears on each task row
-Mark done (N)     Complete all selected tasks at once
-Delete (N)        Delete all selected tasks at once
-Double-click row  Open the Edit Task dialog
-Blocked label     Red "Blocked" chip — this task depends on another unfinished task
-Repeat badge      "repeats every Nd" — task auto-recreates after completion
-
-TIMELINE (MILESTONES)
----------------------
-+ button          Add a new milestone
-Completion slider In the edit dialog: set % complete (0–100)
-Gantt bar fill    Partial fill shows completion %; full bar = done/pending
-Priority outline  Red outline = high · Yellow = normal · Blue = low
-Double-click row  Open the Edit Milestone dialog
-
-NOTES
------
-Star (★)          Pin / unpin note — pinned notes appear on the Project Dashboard
-Expand button     Maximize the note window for distraction-free writing
-Double-click row  Open the note editor inline
-
-GOALS
------
-Entry at top      Add a new goal; supports inline #tags
-Checkbox          Mark goal done / undone directly from the list
-Arrow (→) button  Open the goal detail page
-Double-click row  Same as the arrow button — opens goal detail
-Goal detail page  Edit title, labels, due date; manage sub-tasks (steps)
-Sub-tasks         Add step-by-step tasks specific to that goal
-
-KEYBOARD SHORTCUTS
-------------------
-Escape            Navigate back within a project (section → dashboard)
-Alt + Left arrow  Same as Escape (back)
-"""
-
 class HelpDialog(Adw.Window):
     def __init__(self, parent):
         super().__init__(title="Help & Shortcuts", modal=True, transient_for=parent,
@@ -5447,7 +3990,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         tools_box.append(Gtk.Separator())
         _menu_btn("Focus mode",           "view-fullscreen-symbolic",       self.show_focus_mode)
-        _menu_btn("Weekly review",        "x-office-calendar-symbolic",     self.show_weekly_review)
         _menu_btn("Pinned notes",         "starred-symbolic",               self.show_pinned_notes)
         _menu_btn("Archived projects",    "folder-symbolic",                self.show_archived_projects)
         _menu_btn("Project templates",    "document-open-recent-symbolic",  lambda: ProjectTemplatesDialog(self).present())
@@ -5761,9 +4303,6 @@ class MainWindow(Adw.ApplicationWindow):
     def show_focus_mode(self):
         self._show_content_view(FocusModeView(self), "Focus Mode")
 
-    def show_weekly_review(self):
-        self._show_content_view(WeeklyReviewView(self), "This Week")
-
     def show_pinned_notes(self):
         self._show_content_view(AllPinnedNotesView(self), "Pinned Notes")
 
@@ -5791,42 +4330,33 @@ class WelcomeTutorial(Adw.Window):
         (
             "starred-symbolic",
             "Welcome to Projex",
-            "Your all-in-one project tracker — milestones, tasks, goals, and a writing log, "
-            "all in one native desktop app.\n\nThis quick tour covers the key ideas. "
-            "You can always reopen it from Help & shortcuts in the menu.",
+            "A focused project tracker built around Projects → Goals → Tasks → Notes.\n\n"
+            "This quick tour covers the key ideas. "
+            "You can always reopen it from Help & shortcuts in the ☰ menu.",
         ),
         (
             "folder-symbolic",
             "Projects & the sidebar",
             "Press + in the sidebar to create a project. Each project has its own colour and emoji.\n\n"
-            "Right-click a project in the sidebar to assign it to a named group (e.g. Work / Personal). "
-            "The ☰ menu lets you archive projects when they're done — they move to an Archived section "
-            "on the homepage so your sidebar stays tidy.",
+            "Right-click a project to assign it to a named group (e.g. Work / Personal). "
+            "The ☰ menu lets you archive projects when done — they disappear from the main sidebar "
+            "but stay accessible from the archived list.",
         ),
         (
-            "view-list-symbolic",
-            "Tasks & Milestones",
-            "Inside a project, Tasks is a to-do list. Type #tag in the task name to label it automatically. "
-            "Priority colours the left edge: red = high, blue = low.\n\n"
-            "Milestones appear on a Gantt chart. Set a 'Depends on' link between milestones to draw "
-            "dependency arrows on the chart. Use +7d or +2w in any date field as a shortcut.",
+            "appointment-new-symbolic",
+            "Goals & the Gantt chart",
+            "Goals are milestones with a start date, end date, status, and priority. "
+            "Set a 'Depends on' link between goals to draw dependency arrows on the Gantt chart.\n\n"
+            "Use +7d, +2w, or +1m in any date field as a shortcut. "
+            "Goals appear on the homepage Gantt so you can see every project's timeline at a glance.",
         ),
         (
-            "emblem-important-symbolic",
-            "Goals & Writing log",
-            "Goals are longer-term objectives. Open a goal to add sub-tasks inside it, set a due date, "
-            "and label it with #tags.\n\n"
-            "The Writing log is a journal per project. Each entry has a word count, and you can switch "
-            "to HTML mode for blog-ready formatting. Your weekly word total appears in the Weekly Review.",
-        ),
-        (
-            "x-office-calendar-symbolic",
-            "Power features",
-            "Homepage — Activity heatmap shows the past 26 weeks of completed tasks.\n\n"
-            "Weekly Review (☰ menu) — stats on tasks done, milestones hit, and words written this week, "
-            "with a one-click Markdown export.\n\n"
-            "Focus Mode — surfaces your single highest-priority task with a Pomodoro timer.\n\n"
-            "Project Templates — save any project as a reusable blueprint with date-shifted milestones.",
+            "checkbox-checked-symbolic",
+            "Tasks, Notes & Focus",
+            "Tasks live inside a project — type #tag in the task name to label it instantly. "
+            "Assign a task to a goal to group your work.\n\n"
+            "Notes support free-form text with pinning so highlights float to the dashboard.\n\n"
+            "Focus Mode (☰ menu) surfaces your single highest-priority task with a Pomodoro timer.",
         ),
     ]
 
