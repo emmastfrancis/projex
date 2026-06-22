@@ -39,6 +39,7 @@ APP_CSS = """
     background-color: rgba(224, 27, 36, 0.06);
     box-shadow: inset 2px 0 0 0 rgba(224, 27, 36, 0.7);
 }
+.overdue-project-row .title { color: #e01b24; }
 .proj-bold-row .title { font-weight: bold; }
 """
 
@@ -862,7 +863,7 @@ def section_page(title, content_widget, extra_header_widgets=None):
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -871,7 +872,9 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._show_project_label = show_project_label
         self._tasks = tasks or []
         self._show_tasks = show_tasks
-        self.set_content_height(max(80, len(items) * 36 + 48))
+        self._zoom = max(0.5, min(4.0, zoom))
+        row_h = int(36 * self._zoom)
+        self.set_content_height(max(80, len(items) * row_h + int(48 * self._zoom)))
         self.set_hexpand(True)
         self.set_can_target(False)
         self.set_draw_func(self._draw)
@@ -890,7 +893,11 @@ class _GanttDrawArea(Gtk.DrawingArea):
         items = self._items
         if not items:
             return
-        ROW_H, PAD, LABEL_W, HDR_H = 36, 10, 170, 28
+        z = self._zoom
+        ROW_H  = int(36 * z)
+        HDR_H  = int(28 * z)
+        LABEL_W = int(170 * min(z, 1.5))  # label column grows a bit with zoom but caps
+        PAD = 10
 
         if self._view_start and self._view_end:
             min_d, max_d = self._view_start, self._view_end
@@ -930,8 +937,8 @@ class _GanttDrawArea(Gtk.DrawingArea):
                 cr.set_source_rgba(0.48, 0.52, 0.60, 0.40 if is_jan else 0.18)
                 cr.move_to(x, 0); cr.line_to(x, height); cr.stroke()
                 cr.set_source_rgba(0.78, 0.82, 0.88, 1.0 if is_jan else 0.65)
-                cr.set_font_size(10 if not is_jan else 11)
-                cr.move_to(x + 3, 18)
+                cr.set_font_size((10 if not is_jan else 11) * z)
+                cr.move_to(x + 3, HDR_H * 0.65)
                 cr.show_text(cur.strftime("%Y" if is_jan else "%b"))
                 cur = datetime(cur.year + (cur.month == 12), (cur.month % 12) + 1, 1)
         else:
@@ -948,8 +955,8 @@ class _GanttDrawArea(Gtk.DrawingArea):
                     cr.set_source_rgba(0.48, 0.52, 0.60, 0.40 if is_q1 else 0.15)
                     cr.move_to(x, 0); cr.line_to(x, height); cr.stroke()
                     cr.set_source_rgba(0.78, 0.82, 0.88, 1.0 if is_q1 else 0.55)
-                    cr.set_font_size(11 if is_q1 else 9)
-                    cr.move_to(x + 3, 18)
+                    cr.set_font_size((11 if is_q1 else 9) * z)
+                    cr.move_to(x + 3, HDR_H * 0.65)
                     cr.show_text(qlbl)
 
         # Today marker
@@ -959,8 +966,8 @@ class _GanttDrawArea(Gtk.DrawingArea):
             cr.set_source_rgba(0.93, 0.34, 0.20, 0.90)
             cr.set_line_width(1.5)
             cr.move_to(tx, 0); cr.line_to(tx, height); cr.stroke()
-            cr.set_font_size(9)
-            cr.move_to(tx + 3, 10); cr.show_text("today")
+            cr.set_font_size(9 * z)
+            cr.move_to(tx + 3, HDR_H * 0.40); cr.show_text("today")
 
         bar_pos = {}
         for i, item in enumerate(items):
@@ -979,9 +986,9 @@ class _GanttDrawArea(Gtk.DrawingArea):
 
             label_text = item.get("text") or item.get("title") or ""
             label = label_text[:22] + "…" if len(label_text) > 22 else label_text
-            cr.set_font_size(12)
+            cr.set_font_size(12 * z)
             cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
-            cr.move_to(strip_w + 4, y + ROW_H / 2 + 4)
+            cr.move_to(strip_w + 4, y + ROW_H / 2 + 4 * z)
             cr.show_text(label)
 
             try:
@@ -997,7 +1004,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
 
             x1, x2 = x_of(d1c), x_of(d2c)
             bw = max(5.0, x2 - x1)
-            bx, by, bh, r = x1, y + 7, ROW_H - 14, 4.0
+            bx, by, bh, r = x1, y + int(7 * z), ROW_H - int(14 * z), 4.0
 
             mid = y + ROW_H / 2
             item_id = item.get("id")
@@ -1037,17 +1044,17 @@ class _GanttDrawArea(Gtk.DrawingArea):
 
             if d1 < min_d or d2 > max_d:
                 cr.set_source_rgba(1, 1, 1, 0.55)
-                cr.set_font_size(9)
+                cr.set_font_size(9 * z)
                 if d1 < min_d:
                     cr.move_to(bx + 2, by + bh - 2); cr.show_text("◀")
                 if d2 > max_d:
-                    cr.move_to(bx + bw - 10, by + bh - 2); cr.show_text("▶")
+                    cr.move_to(bx + bw - 10 * z, by + bh - 2); cr.show_text("▶")
 
 
         # Task due-date markers (vertical white lines, like the today line)
         if self._tasks and self._show_tasks:
             cr.set_line_width(1.0)
-            cr.set_font_size(9)
+            cr.set_font_size(10 * z)
             for task in self._tasks:
                 dd = task.get("due_date") or ""
                 if not dd:
@@ -1066,7 +1073,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
                 label = (task.get("text") or "")[:18]
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.50)
                 cr.save()
-                cr.translate(tx + 3, HDR_H + 12)
+                cr.translate(tx + 3 * z, HDR_H + 14 * z)
                 cr.rotate(math.pi / 2)
                 cr.show_text(label)
                 cr.restore()
@@ -1091,14 +1098,34 @@ class GanttChart(Gtk.Box):
         self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild))
 
         self._show_tasks = True
-        self._tasks_toggle = Gtk.ToggleButton(label="Task lines", active=True)
-        self._tasks_toggle.add_css_class("flat")
-        self._tasks_toggle.connect("toggled", self._on_tasks_toggle)
+        self._tasks_switch = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
+        self._tasks_switch.connect("notify::active", self._on_tasks_toggle)
+        tasks_lbl = Gtk.Label(label="Show task lines", valign=Gtk.Align.CENTER)
+        tasks_lbl.add_css_class("caption")
+
+        self._zoom = 1.0
+        self._zoom_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.5, 3.0, 0.25)
+        self._zoom_scale.set_value(1.0)
+        self._zoom_scale.set_size_request(120, -1)
+        self._zoom_scale.set_draw_value(False)
+        self._zoom_scale.set_valign(Gtk.Align.CENTER)
+        self._zoom_scale.connect("value-changed", self._on_zoom)
+        zoom_lbl = Gtk.Label(label="Zoom", valign=Gtk.Align.CENTER)
+        zoom_lbl.add_css_class("caption")
 
         hdr = Gtk.Box(spacing=10, margin_bottom=2)
         hdr.append(Gtk.Label(label="View:"))
         hdr.append(self._year_drop)
-        hdr.append(self._tasks_toggle)
+        sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep1.set_margin_start(4); sep1.set_margin_end(4)
+        hdr.append(sep1)
+        hdr.append(tasks_lbl)
+        hdr.append(self._tasks_switch)
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_margin_start(4); sep2.set_margin_end(4)
+        hdr.append(sep2)
+        hdr.append(zoom_lbl)
+        hdr.append(self._zoom_scale)
         self.append(hdr)
 
         self._chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1118,8 +1145,12 @@ class GanttChart(Gtk.Box):
         y = int(opt)
         return datetime(y, 1, 1), datetime(y, 12, 31)
 
-    def _on_tasks_toggle(self, btn):
-        self._show_tasks = btn.get_active()
+    def _on_tasks_toggle(self, sw, _param=None):
+        self._show_tasks = sw.get_active()
+        GLib.idle_add(self._rebuild)
+
+    def _on_zoom(self, scale):
+        self._zoom = scale.get_value()
         GLib.idle_add(self._rebuild)
 
     def _rebuild(self):
@@ -1175,9 +1206,25 @@ class GanttChart(Gtk.Box):
                 ).fetchall()
         tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom)
         da.set_hexpand(False)
-        da.set_content_width(max(900, len(items) * 60))
+        # Base content width on date range (3 px/day at 1× zoom) for natural scaling
+        try:
+            all_dates = []
+            for it in items:
+                if it.get("start_date"): all_dates.append(datetime.strptime(it["start_date"], "%Y-%m-%d"))
+                if it.get("end_date"):   all_dates.append(datetime.strptime(it["end_date"],   "%Y-%m-%d"))
+            if vstart: all_dates.append(vstart)
+            if vend:   all_dates.append(vend)
+            if all_dates:
+                span_days = max(1, (max(all_dates) - min(all_dates)).days + 6)
+            else:
+                span_days = 365
+        except Exception:
+            span_days = 365
+        LABEL_W = int(170 * min(self._zoom, 1.5))
+        base_w = LABEL_W + 20 + int(span_days * 3 * self._zoom)
+        da.set_content_width(max(900, base_w))
 
         h_scroll = Gtk.ScrolledWindow()
         h_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
@@ -2568,6 +2615,7 @@ class GoalsView(Gtk.Box):
             g_snap = dict(g)
             priority = safe_col(g, "priority") or "normal"
             status   = safe_col(g, "status")   or "pending"
+            if g["done"]: status = "done"  # checkbox always wins over stale status value
             start    = safe_col(g, "start_date")
             end      = safe_col(g, "end_date")
 
@@ -2645,9 +2693,11 @@ class GoalsView(Gtk.Box):
             self._content.append(gantt)
 
     def _toggle_done(self, gid, done):
-        status = "done" if done else "active"
         with get_db() as c:
-            c.execute("UPDATE goal SET done=?, status=? WHERE id=?", (int(done), status, gid))
+            if done:
+                c.execute("UPDATE goal SET done=1, status='done' WHERE id=?", (gid,))
+            else:
+                c.execute("UPDATE goal SET done=0, status='active' WHERE id=?", (gid,))
         self._refresh()
 
     def _delete(self, gid):
