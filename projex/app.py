@@ -2203,6 +2203,16 @@ class GoalsView(Gtk.Box):
         self._refresh()
 
     def _refresh(self):
+        try:
+            self._do_refresh()
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            lbl = Gtk.Label(label=f"Goals view error: {exc}", wrap=True)
+            lbl.add_css_class("error")
+            self._content.append(lbl)
+
+    def _do_refresh(self):
         clear_box(self._content)
         goals = db_goals(self._pid)
 
@@ -3533,7 +3543,13 @@ class ProjectDetailView(Gtk.Box):
         self._push("To-do list", TodosView(self._pid, self._win))
 
     def _open_goals(self):
-        self._push("Goals", GoalsView(self._pid, self._win, push_fn=self._push))
+        try:
+            self._push("Goals", GoalsView(self._pid, self._win, push_fn=self._push))
+        except Exception as exc:
+            import traceback, traceback as tb
+            traceback.print_exc()
+            toast = Adw.Toast(title=f"Goals error: {exc}", timeout=10)
+            self._win._toast_overlay.add_toast(toast)
 
     def _open_tags(self):
         self._push("Labels", TagsView(self._pid, self._win))
