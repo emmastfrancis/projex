@@ -1757,18 +1757,20 @@ class FileEditDialog(Adw.Window):
 
 class QuickTaskDialog(Adw.Window):
     """Compact task-add dialog accessible from the home overview."""
-    def __init__(self, parent, pid, project_name, on_save=None):
+    def __init__(self, parent, pid, project_name, on_save=None, goal_id=None, goal_name=None):
         super().__init__(
             title=f"Quick task — {project_name}",
             modal=True, transient_for=parent,
             default_width=400, resizable=False,
         )
-        self._pid = pid; self._on_save = on_save
+        self._pid = pid; self._on_save = on_save; self._goal_id = goal_id
         tv = Adw.ToolbarView()
         tv.add_top_bar(Adw.HeaderBar())
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
         grp = Adw.PreferencesGroup()
+        if goal_name:
+            grp.set_description(f"Will be linked to goal: {goal_name}")
         self._entry = Adw.EntryRow(title="Task  (type #tag to label, press Enter)")
         self._entry.connect("entry-activated", self._save)
         grp.add(self._entry)
@@ -1799,8 +1801,8 @@ class QuickTaskDialog(Adw.Window):
                 "SELECT COALESCE(MAX(order_pos)+1,0) FROM todo WHERE project_id=? AND done=0",
                 (self._pid,)).fetchone()[0])
             c.execute(
-                "INSERT INTO todo (project_id,text,priority,tags,order_pos,due_date) VALUES (?,?,?,?,?,?)",
-                (self._pid, text, priority, tags, new_pos, due_date),
+                "INSERT INTO todo (project_id,text,priority,tags,order_pos,due_date,goal_id) VALUES (?,?,?,?,?,?,?)",
+                (self._pid, text, priority, tags, new_pos, due_date, self._goal_id),
             )
         if self._on_save: self._on_save()
         self.close()
@@ -2603,6 +2605,9 @@ class GoalsView(Gtk.Box):
         clear_box(self._content)
         goals = db_goals(self._pid)
 
+        active_goals = [g for g in goals if not g["done"]]
+        done_goals   = [g for g in goals if g["done"]]
+
         grp = Adw.PreferencesGroup(title="Goals")
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
         add_btn.add_css_class("flat")
@@ -2611,19 +2616,34 @@ class GoalsView(Gtk.Box):
 
         if not goals:
             grp.add(Adw.ActionRow(title="No goals yet — press + to add one"))
-        for g in goals:
+
+        def _make_goal_row(g):
             g_snap = dict(g)
             priority = safe_col(g, "priority") or "normal"
             status   = safe_col(g, "status")   or "pending"
-            if g["done"]: status = "done"  # checkbox always wins over stale status value
+            if g["done"]: status = "done"
             start    = safe_col(g, "start_date")
             end      = safe_col(g, "end_date")
 
+            # Task completion progress for this goal
+            with get_db() as c:
+                goal_tasks = c.execute(
+                    "SELECT done FROM todo WHERE goal_id=?", (g["id"],)
+                ).fetchall()
+            task_total = len(goal_tasks)
+            task_done  = sum(1 for t in goal_tasks if t["done"])
+
             row = Adw.ActionRow(title=g["text"])
-            sub = f"{start} → {end}" if start and end else (end if end else "No dates set")
+            sub_parts = []
+            if start and end:
+                sub_parts.append(f"{start} → {end}")
+            elif end:
+                sub_parts.append(end)
+            if task_total:
+                sub_parts.append(f"{task_done}/{task_total} tasks done")
             notes = safe_col(g, "notes")
-            if notes: sub += f"  ·  {notes}"
-            row.set_subtitle(sub)
+            if notes: sub_parts.append(notes)
+            row.set_subtitle("  ·  ".join(sub_parts) if sub_parts else "No dates set")
 
             pri_lbl = Gtk.Label(label=priority.upper())
             pri_lbl.add_css_class("caption")
@@ -2639,8 +2659,28 @@ class GoalsView(Gtk.Box):
             badge.set_valign(Gtk.Align.CENTER)
             row.add_suffix(badge)
 
+            # Task progress bar if tasks are linked
+            if task_total:
+                pbar = Gtk.ProgressBar()
+                pbar.set_fraction(task_done / task_total)
+                pbar.set_size_request(60, -1)
+                pbar.set_valign(Gtk.Align.CENTER)
+                row.add_suffix(pbar)
+
             row.set_activatable(True)
             row.connect("activated", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
+
+            # Quick-add task linked to this goal
+            quick_btn = Gtk.Button(icon_name="list-add-symbolic")
+            quick_btn.add_css_class("flat"); quick_btn.set_valign(Gtk.Align.CENTER)
+            quick_btn.set_tooltip_text("Add task to this goal")
+            quick_btn.connect(
+                "clicked",
+                lambda _, gid=g["id"], gname=g["text"]:
+                    QuickTaskDialog(self._win, self._pid, gname, on_save=self._refresh,
+                                    goal_id=gid, goal_name=gname).present()
+            )
+            row.add_suffix(quick_btn)
 
             eb = Gtk.Button(icon_name="document-edit-symbolic")
             eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
@@ -2662,26 +2702,40 @@ class GoalsView(Gtk.Box):
             if g["done"]:
                 row.add_css_class("dim-label")
 
-            grp.add(row)
+            return row
+
+        for g in active_goals:
+            grp.add(_make_goal_row(g))
 
         self._content.append(grp)
 
-        linked_todos = [t for t in db_todos(self._pid) if safe_col(t, "goal_id")]
-        if linked_todos:
-            goal_map = {g["id"]: g["text"] for g in goals}
-            from collections import defaultdict
-            by_goal = defaultdict(list)
-            for t in linked_todos:
-                by_goal[safe_col(t, "goal_id")].append(t)
-            linked_grp = Adw.PreferencesGroup(title="Tasks linked to goals")
-            for gid, tasks in by_goal.items():
-                for t in tasks:
-                    goal_name = goal_map.get(gid, "Unknown goal")
-                    trow = Adw.ActionRow(title=t["text"], subtitle=f"→ {goal_name}")
-                    if t["done"]:
-                        trow.add_css_class("dim-label")
-                    linked_grp.add(trow)
-            self._content.append(linked_grp)
+        # ── Completed goals (collapsible) ─────────────────────
+        if done_goals:
+            done_state = [False]
+            n_done = len(done_goals)
+            done_toggle_lbl = Gtk.Label(css_classes=["caption"])
+            done_toggle_lbl.set_markup(f"<small>▶  {n_done} completed goal{'s' if n_done != 1 else ''}</small>")
+            done_toggle_lbl.set_xalign(0)
+            done_toggle_btn = Gtk.Button()
+            done_toggle_btn.set_child(done_toggle_lbl)
+            done_toggle_btn.add_css_class("flat")
+            done_toggle_btn.set_margin_top(4)
+
+            done_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, reveal_child=False)
+            done_inner_grp = Adw.PreferencesGroup()
+            for g in done_goals:
+                done_inner_grp.add(_make_goal_row(g))
+            done_rev.set_child(done_inner_grp)
+
+            def _on_done_toggle(_btn):
+                done_state[0] = not done_state[0]
+                done_rev.set_reveal_child(done_state[0])
+                arrow = "▼" if done_state[0] else "▶"
+                done_toggle_lbl.set_markup(f"<small>{arrow}  {n_done} completed goal{'s' if n_done != 1 else ''}</small>")
+            done_toggle_btn.connect("clicked", _on_done_toggle)
+
+            self._content.append(done_toggle_btn)
+            self._content.append(done_rev)
 
         goals_with_dates = [g for g in goals if safe_col(g, "start_date") and safe_col(g, "end_date")]
         if goals_with_dates:
@@ -2973,6 +3027,7 @@ class NotesView(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
         self._pid = pid; self._win = win; self._push_fn = push_fn
+        self._search_text = ""
 
         sc = Gtk.ShortcutController()
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
@@ -2982,8 +3037,16 @@ class NotesView(Gtk.Box):
         ))
         self.add_controller(sc)
 
+        search_entry = Gtk.SearchEntry(placeholder_text="Search notes…")
+        search_entry.connect("search-changed", self._on_search)
+        self.append(search_entry)
+
         self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.append(self._content)
+        self._refresh()
+
+    def _on_search(self, entry):
+        self._search_text = entry.get_text().strip().lower()
         self._refresh()
 
     def _open_new(self):
@@ -3002,8 +3065,12 @@ class NotesView(Gtk.Box):
 
     def _refresh(self):
         clear_box(self._content)
-        notes = db_notes(self._pid)
-        grp = Adw.PreferencesGroup(title="Notes")
+        all_notes = db_notes(self._pid)
+        q = self._search_text
+        notes = [n for n in all_notes
+                 if not q or q in n["content"].lower() or q in (safe_col(n, "tags") or "").lower()]
+        title = "Notes" if not q else f"Notes — {len(notes)} match{'es' if len(notes) != 1 else ''}"
+        grp = Adw.PreferencesGroup(title=title)
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
         add_btn.add_css_class("flat")
         add_btn.connect("clicked", lambda _: self._open_new())
@@ -3513,7 +3580,8 @@ class HomeView(Gtk.Box):
                 urgency_tx = ("today!" if days_left == 0 else
                               "tomorrow" if days_left == 1 else f"{days_left}d left")
                 row = Adw.ActionRow(title=it["title"])
-                row.set_subtitle(f"{it['kind']}  ·  {it['project_name']}  ·  {end_date}")
+                kind_lbl = "🎯 Goal" if it["kind"] == "Goal" else "✓ Task"
+                row.set_subtitle(f"{kind_lbl}  ·  {it['project_name']}  ·  {end_date}")
                 dot = color_dot(it.get("project_color") or "#4fa8c4", size=10)
                 dot.set_valign(Gtk.Align.CENTER)
                 row.add_prefix(dot)
@@ -3523,6 +3591,9 @@ class HomeView(Gtk.Box):
                 ul.add_css_class("caption"); ul.add_css_class(urgency_cl)
                 ul.set_valign(Gtk.Align.CENTER)
                 row.add_suffix(ul)
+                # Red left-border for goals within 3 days
+                if it["kind"] == "Goal" and days_left <= 3:
+                    row.add_css_class("overdue-project-row")
                 due_grp.add(row)
             self.append(due_grp)
 
