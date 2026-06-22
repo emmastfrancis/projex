@@ -1041,30 +1041,6 @@ class _GanttDrawArea(Gtk.DrawingArea):
                 if d2 > max_d:
                     cr.move_to(bx + bw - 10, by + bh - 2); cr.show_text("▶")
 
-        # Dependency arrows
-        cr.set_line_width(1.5)
-        for item in items:
-            dep_id = int(safe_col(item, "blocked_by") or 0)
-            item_id = item.get("id")
-            if not dep_id or dep_id not in bar_pos or not item_id or item_id not in bar_pos:
-                continue
-            px1, px2, py_mid = bar_pos[dep_id]
-            cx1, cx2, cy_mid = bar_pos[item_id]
-            x0, y0 = px2, py_mid
-            x3, y3 = cx1, cy_mid
-            spread = max(30.0, abs(x3 - x0) * 0.45)
-            cp1x, cp1y = x0 + spread, y0
-            cp2x, cp2y = x3 - spread, y3
-            cr.set_source_rgba(0.95, 0.75, 0.20, 0.70)
-            cr.move_to(x0, y0)
-            cr.curve_to(cp1x, cp1y, cp2x, cp2y, x3, y3)
-            cr.stroke()
-            cr.set_source_rgba(0.95, 0.75, 0.20, 0.85)
-            cr.move_to(x3, y3)
-            cr.line_to(x3 - 7, y3 - 4)
-            cr.line_to(x3 - 7, y3 + 4)
-            cr.close_path()
-            cr.fill()
 
         # Task due-date markers (triangles below goal bars)
         if self._tasks:
@@ -1502,23 +1478,6 @@ class GoalEditDialog(Adw.Window):
         pri_row.add_suffix(self._pri)
         fields.add(pri_row)
 
-        with get_db() as c:
-            _all_goals = c.execute(
-                "SELECT id, text FROM goal WHERE project_id=? ORDER BY id", (pid,)
-            ).fetchall()
-        _other = [g for g in _all_goals if not goal or g["id"] != safe_col(goal, "id")]
-        _dep_labels = ["— none —"] + [g["text"] for g in _other]
-        _dep_ids    = [0] + [g["id"] for g in _other]
-        dep_row = Adw.ActionRow(title="Depends on")
-        self._dep_drop = Gtk.DropDown.new_from_strings(_dep_labels)
-        self._dep_drop.set_valign(Gtk.Align.CENTER)
-        cur_blocked = int(safe_col(goal, "blocked_by") or 0) if goal else 0
-        if cur_blocked in _dep_ids:
-            self._dep_drop.set_selected(_dep_ids.index(cur_blocked))
-        self._dep_ids = _dep_ids
-        dep_row.add_suffix(self._dep_drop)
-        fields.add(dep_row)
-
         box.append(fields)
 
         date_grp = Adw.PreferencesGroup(title="Dates")
@@ -1647,10 +1606,9 @@ class GoalEditDialog(Adw.Window):
         end      = expand_date_shortcut(self._end.get_text().strip()) or ""
         done     = 1 if status == "done" else 0
         due_date = end
-        blocked_by  = self._dep_ids[self._dep_drop.get_selected()]
         linked_note = self._note_ids[self._note_drop.get_selected()]
 
-        # Save inline note as a new note in this project (if non-empty)
+        # Save inline note to the project's Notes section (independent of linked_note)
         buf = self._inline_note.get_buffer()
         inline_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
 
@@ -1658,24 +1616,23 @@ class GoalEditDialog(Adw.Window):
             if inline_text:
                 c.execute(
                     "INSERT INTO note (project_id,content,tags,created_date) VALUES (?,?,?,?)",
-                    (self._pid, inline_text, tags, date.today().isoformat())
+                    (self._pid, inline_text, "", date.today().isoformat())
                 )
-                linked_note = c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             if self._goal:
                 c.execute(
                     "UPDATE goal SET text=?,status=?,priority=?,tags=?,notes=?,"
-                    "start_date=?,end_date=?,done=?,due_date=?,blocked_by=?,linked_note_id=? WHERE id=?",
+                    "start_date=?,end_date=?,done=?,due_date=?,linked_note_id=? WHERE id=?",
                     (name, status, priority, tags, notes, start, end, done, due_date,
-                     blocked_by, linked_note, self._goal["id"])
+                     linked_note, self._goal["id"])
                 )
             else:
                 c.execute(
                     "INSERT INTO goal (project_id,text,status,priority,tags,notes,"
-                    "start_date,end_date,done,due_date,blocked_by,linked_note_id)"
-                    " VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
+                    "start_date,end_date,done,due_date,linked_note_id)"
+                    " VALUES (?,?,?,?,?,?,?,?,0,?,?)",
                     (self._pid, name, status, priority, tags, notes, start, end,
-                     due_date, blocked_by, linked_note)
+                     due_date, linked_note)
                 )
         if self._on_save: self._on_save()
         self.close()
@@ -3367,6 +3324,15 @@ class HomeView(Gtk.Box):
             health_dot.add_css_class(_HEALTH_CSS.get(health_color, "dim-label"))
             if health_color == "red":
                 row.add_css_class("overdue-project-row")
+                overdue_btn = Gtk.Button(label="Overdue →")
+                overdue_btn.add_css_class("flat"); overdue_btn.add_css_class("error")
+                overdue_btn.set_valign(Gtk.Align.CENTER)
+                overdue_btn.set_tooltip_text("Jump to overdue tasks")
+                overdue_btn.connect(
+                    "clicked",
+                    lambda _, pid=p["id"]: self._win._open_project(pid, section="tasks")
+                )
+                row.add_suffix(overdue_btn)
             elif health_color == "yellow":
                 row.add_css_class("warning")
             row.add_prefix(health_dot)
@@ -3412,16 +3378,8 @@ class HomeView(Gtk.Box):
 
         active_ps = [p for p in projects if p["status"] != "archived"]
 
-        overdue_note = Gtk.Label(label="projects in red have overdue items")
-        overdue_note.add_css_class("caption"); overdue_note.add_css_class("dim-label")
-        overdue_note.set_xalign(0)
-        overdue_note.set_margin_bottom(4)
-        # italic via markup
-        overdue_note.set_use_markup(True)
-        overdue_note.set_label("<i>projects in red have overdue items</i>")
-        self.append(overdue_note)
-
-        proj_grp = Adw.PreferencesGroup(title="Projects")
+        proj_grp = Adw.PreferencesGroup(title="Projects",
+                                         description='Projects in red have overdue items — click “Overdue” to jump straight to them')
         if not active_ps:
             proj_grp.add(Adw.ActionRow(
                 title="All projects are archived",
