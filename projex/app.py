@@ -35,6 +35,10 @@ APP_CSS = """
 }
 .task-row-high { background-color: rgba(224, 27, 36, 0.07); }
 .group-header-row { font-weight: bold; opacity: 0.75; }
+.overdue-project-row {
+    background-color: rgba(224, 27, 36, 0.06);
+    box-shadow: inset 2px 0 0 0 rgba(224, 27, 36, 0.7);
+}
 """
 
 COLOR_PALETTE = [
@@ -446,8 +450,9 @@ def migrate_db():
             "ALTER TABLE goal ADD COLUMN priority    TEXT    DEFAULT 'normal'",
             "ALTER TABLE goal ADD COLUMN notes       TEXT    DEFAULT ''",
             "ALTER TABLE goal ADD COLUMN blocked_by  INTEGER DEFAULT 0",
-            "ALTER TABLE todo ADD COLUMN goal_id     INTEGER DEFAULT NULL",
-            "ALTER TABLE todo ADD COLUMN recur_end_date TEXT DEFAULT ''",
+            "ALTER TABLE todo ADD COLUMN goal_id         INTEGER DEFAULT NULL",
+            "ALTER TABLE todo ADD COLUMN recur_end_date  TEXT    DEFAULT ''",
+            "ALTER TABLE goal ADD COLUMN linked_note_id  INTEGER DEFAULT NULL",
         ]:
             try:
                 c.execute(sql)
@@ -1113,7 +1118,7 @@ class GanttChart(Gtk.Box):
             [str(y) for y in range(today.year - 1, today.year + 9)]
         )
         self._year_drop = Gtk.DropDown.new_from_strings(self._year_opts)
-        self._year_drop.set_selected(4)  # default: current year
+        self._year_drop.set_selected(0)  # default: All (show every goal regardless of year)
         self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild))
 
         hdr = Gtk.Box(spacing=10, margin_bottom=2)
@@ -1192,7 +1197,14 @@ class GanttChart(Gtk.Box):
         tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
 
         da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list)
-        self._chart_box.append(da)
+        da.set_hexpand(False)
+        da.set_content_width(max(900, len(items) * 60))
+
+        h_scroll = Gtk.ScrolledWindow()
+        h_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        h_scroll.set_hexpand(True)
+        h_scroll.set_child(da)
+        self._chart_box.append(h_scroll)
 
     def _in_range(self, item, vstart, vend):
         try:
@@ -1549,6 +1561,45 @@ class GoalEditDialog(Adw.Window):
         for er in (self._name, self._notes_row, self._tags_row, self._start, self._end):
             er.connect("entry-activated", self._save)
 
+        # ── Linked / inline note ───────────────────────────────────
+        note_grp = Adw.PreferencesGroup(title="Note")
+        note_grp.set_description("Write a note for this goal, or link an existing one")
+
+        # Existing notes dropdown (all projects)
+        with get_db() as _c:
+            _all_notes = _c.execute(
+                "SELECT n.id, n.content, n.project_id, p.name AS proj_name "
+                "FROM note n JOIN project p ON n.project_id=p.id "
+                "ORDER BY n.created_date DESC LIMIT 60"
+            ).fetchall()
+        _note_labels = ["— no linked note —"] + [
+            f"{n['proj_name']}: {(n['content'] or '')[:40].replace(chr(10),' ')}"
+            for n in _all_notes
+        ]
+        _note_ids = [None] + [n["id"] for n in _all_notes]
+        link_row = Adw.ActionRow(title="Link existing note")
+        self._note_drop = Gtk.DropDown.new_from_strings(_note_labels)
+        self._note_drop.set_valign(Gtk.Align.CENTER)
+        cur_linked = int(safe_col(goal, "linked_note_id") or 0) if goal else 0
+        if cur_linked and cur_linked in _note_ids:
+            self._note_drop.set_selected(_note_ids.index(cur_linked))
+        self._note_ids = _note_ids
+        link_row.add_suffix(self._note_drop)
+        note_grp.add(link_row)
+
+        # Inline note text area
+        inline_lbl = Adw.ActionRow(title="Or write a new note")
+        note_grp.add(inline_lbl)
+        note_scroll = Gtk.ScrolledWindow()
+        note_scroll.add_css_class("card")
+        note_scroll.set_size_request(-1, 90)
+        self._inline_note = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD,
+                                         top_margin=8, bottom_margin=8,
+                                         left_margin=8, right_margin=8)
+        note_scroll.set_child(self._inline_note)
+        box.append(note_grp)
+        box.append(note_scroll)
+
         btn = Gtk.Button(label="Save")
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
@@ -1596,19 +1647,35 @@ class GoalEditDialog(Adw.Window):
         end      = expand_date_shortcut(self._end.get_text().strip()) or ""
         done     = 1 if status == "done" else 0
         due_date = end
-        blocked_by = self._dep_ids[self._dep_drop.get_selected()]
+        blocked_by  = self._dep_ids[self._dep_drop.get_selected()]
+        linked_note = self._note_ids[self._note_drop.get_selected()]
+
+        # Save inline note as a new note in this project (if non-empty)
+        buf = self._inline_note.get_buffer()
+        inline_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
+
         with get_db() as c:
+            if inline_text:
+                c.execute(
+                    "INSERT INTO note (project_id,content,tags,created_date) VALUES (?,?,?,?)",
+                    (self._pid, inline_text, tags, date.today().isoformat())
+                )
+                linked_note = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
             if self._goal:
                 c.execute(
                     "UPDATE goal SET text=?,status=?,priority=?,tags=?,notes=?,"
-                    "start_date=?,end_date=?,done=?,due_date=?,blocked_by=? WHERE id=?",
-                    (name, status, priority, tags, notes, start, end, done, due_date, blocked_by, self._goal["id"])
+                    "start_date=?,end_date=?,done=?,due_date=?,blocked_by=?,linked_note_id=? WHERE id=?",
+                    (name, status, priority, tags, notes, start, end, done, due_date,
+                     blocked_by, linked_note, self._goal["id"])
                 )
             else:
                 c.execute(
-                    "INSERT INTO goal (project_id,text,status,priority,tags,notes,start_date,end_date,done,due_date,blocked_by)"
-                    " VALUES (?,?,?,?,?,?,?,?,0,?,?)",
-                    (self._pid, name, status, priority, tags, notes, start, end, due_date, blocked_by)
+                    "INSERT INTO goal (project_id,text,status,priority,tags,notes,"
+                    "start_date,end_date,done,due_date,blocked_by,linked_note_id)"
+                    " VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
+                    (self._pid, name, status, priority, tags, notes, start, end,
+                     due_date, blocked_by, linked_note)
                 )
         if self._on_save: self._on_save()
         self.close()
@@ -1913,7 +1980,7 @@ class TodosView(Gtk.Box):
 
         # ── Persistent add-entry (top, never rebuilt) ─────────
         add_grp = Adw.PreferencesGroup(title="Add task")
-        self._entry = Adw.EntryRow(title="Task name — press Enter to add")
+        self._entry = Adw.EntryRow(title="Task name")
         self._entry_pri = Gtk.DropDown.new_from_strings(PRIORITIES)
         self._entry_pri.set_valign(Gtk.Align.CENTER)
         self._entry_pri.set_tooltip_text("Priority")
@@ -1922,10 +1989,12 @@ class TodosView(Gtk.Box):
         add_grp.add(self._entry)
 
         self._entry_tags = Adw.EntryRow(title="Labels (e.g. #design #urgent, optional)")
+        self._entry_tags.connect("entry-activated", lambda _: self._on_add(self._entry))
         add_grp.add(self._entry_tags)
 
         self._entry_due = Adw.EntryRow(title="Due date (e.g. monday, june 5, +7d, optional)")
         _wire_date_shortcut(self._entry_due)
+        self._entry_due.connect("entry-activated", lambda _: self._on_add(self._entry))
         add_grp.add(self._entry_due)
 
         recur_add_row = Adw.ActionRow(title="Repeat", subtitle="Days between recurrences (0 = no repeat)")
@@ -1937,6 +2006,12 @@ class TodosView(Gtk.Box):
         recur_add_box.append(Gtk.Label(label="days", valign=Gtk.Align.CENTER))
         recur_add_row.add_suffix(recur_add_box)
         add_grp.add(recur_add_row)
+
+        add_task_btn = Gtk.Button(label="Add task")
+        add_task_btn.add_css_class("suggested-action"); add_task_btn.add_css_class("pill")
+        add_task_btn.set_margin_top(6)
+        add_task_btn.connect("clicked", lambda _: self._on_add(self._entry))
+        add_grp.set_header_suffix(add_task_btn)
 
         self.append(add_grp)
 
@@ -2229,7 +2304,6 @@ class TodosView(Gtk.Box):
         check.set_valign(Gtk.Align.CENTER)
         check.connect("toggled", lambda _b, i=tid: self._toggle(i))
         row.add_prefix(check)
-        row.set_activatable_widget(check)
 
         # ── Suffix: priority drop (active), edit, delete ──────
         if not is_done:
@@ -3292,7 +3366,7 @@ class HomeView(Gtk.Box):
             _HEALTH_CSS = {"green": "success", "yellow": "warning", "red": "error"}
             health_dot.add_css_class(_HEALTH_CSS.get(health_color, "dim-label"))
             if health_color == "red":
-                row.add_css_class("error")
+                row.add_css_class("overdue-project-row")
             elif health_color == "yellow":
                 row.add_css_class("warning")
             row.add_prefix(health_dot)
@@ -3337,6 +3411,15 @@ class HomeView(Gtk.Box):
             return row
 
         active_ps = [p for p in projects if p["status"] != "archived"]
+
+        overdue_note = Gtk.Label(label="projects in red have overdue items")
+        overdue_note.add_css_class("caption"); overdue_note.add_css_class("dim-label")
+        overdue_note.set_xalign(0)
+        overdue_note.set_margin_bottom(4)
+        # italic via markup
+        overdue_note.set_use_markup(True)
+        overdue_note.set_label("<i>projects in red have overdue items</i>")
+        self.append(overdue_note)
 
         proj_grp = Adw.PreferencesGroup(title="Projects")
         if not active_ps:
