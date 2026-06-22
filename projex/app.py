@@ -792,10 +792,8 @@ class _GanttDrawArea(Gtk.DrawingArea):
             return (0.15, 0.63, 0.41, 0.92)   # green
         if status == "blocked":
             return (0.88, 0.11, 0.14, 0.92)   # red
-        if status == "active":
-            return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
-        # pending or unknown → dim blue-gray
-        return (0.42, 0.46, 0.54, 0.85)
+        # active, pending, or no status → accent (project colour)
+        return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
 
     def _draw(self, area, cr, width, height):
         items = self._items
@@ -2243,10 +2241,12 @@ class GoalsView(Gtk.Box):
             badge.set_valign(Gtk.Align.CENTER)
             row.add_suffix(badge)
 
+            row.set_activatable(True)
+            row.connect("activated", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
+
             eb = Gtk.Button(icon_name="document-edit-symbolic")
             eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
             eb.connect("clicked", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
-            add_dblclick(row, lambda gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
             row.add_suffix(eb)
 
             done_cb = Gtk.CheckButton(active=bool(g["done"]))
