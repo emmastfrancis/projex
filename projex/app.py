@@ -574,6 +574,16 @@ def db_create_group(name):
     with get_db() as c:
         c.execute("INSERT INTO project_group (name) VALUES (?)", (name,))
 
+def _confirm_delete(parent, heading, body, on_confirm):
+    dlg = Adw.AlertDialog(heading=heading, body=body)
+    dlg.add_response("cancel", "Cancel")
+    dlg.add_response("delete", "Delete")
+    dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+    dlg.set_default_response("cancel")
+    dlg.set_close_response("cancel")
+    dlg.connect("response", lambda d, r: on_confirm() if r == "delete" else None)
+    dlg.present(parent)
+
 def db_delete_group(gid):
     with get_db() as c:
         c.execute("UPDATE project SET group_id=0 WHERE group_id=?", (gid,))
@@ -1791,10 +1801,13 @@ class GoalEditDialog(Adw.Window):
 
     def _delete_goal(self, _):
         if not self._goal: return
-        with get_db() as c:
-            c.execute("DELETE FROM goal WHERE id=?", (self._goal["id"],))
-        if self._on_save: self._on_save()
-        self.close()
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM goal WHERE id=?", (self._goal["id"],))
+            if self._on_save: self._on_save()
+            self.close()
+        _confirm_delete(self, "Delete goal?",
+                        "\"" + safe_col(self._goal, "text") + "\" will be permanently removed.", _do)
 
 
 class FileEditDialog(Adw.Window):
@@ -2103,10 +2116,13 @@ class TodoEditDialog(Adw.Window):
         self.close()
 
     def _delete_task(self, _):
-        with get_db() as c:
-            c.execute("DELETE FROM todo WHERE id=?", (self._todo["id"],))
-        if self._on_save: self._on_save()
-        self.close()
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM todo WHERE id=?", (self._todo["id"],))
+            if self._on_save: self._on_save()
+            self.close()
+        _confirm_delete(self, "Delete task?",
+                        "\"" + safe_col(self._todo, "text") + "\" will be permanently removed.", _do)
 
 
 class ChangelogDialog(Adw.Window):
@@ -2668,10 +2684,15 @@ class TodosView(Gtk.Box):
         self._exit_bulk_mode()
 
     def _bulk_delete(self, _):
-        with get_db() as c:
-            for tid in self._selected_ids:
-                c.execute("DELETE FROM todo WHERE id=?", (tid,))
-        self._exit_bulk_mode()
+        n = len(self._selected_ids)
+        ids = list(self._selected_ids)
+        def _do():
+            with get_db() as c:
+                for tid in ids:
+                    c.execute("DELETE FROM todo WHERE id=?", (tid,))
+            self._exit_bulk_mode()
+        _confirm_delete(self._win, "Delete tasks?",
+                        f"{n} task{'s' if n != 1 else ''} will be permanently removed.", _do)
 
     def _exit_bulk_mode(self):
         self._bulk_mode = False
@@ -2709,9 +2730,11 @@ class TodosView(Gtk.Box):
             c.execute("UPDATE todo SET priority=? WHERE id=?", (priority, tid))
 
     def _delete(self, tid):
-        with get_db() as c:
-            c.execute("DELETE FROM todo WHERE id=?", (tid,))
-        GLib.idle_add(self._build_content)
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM todo WHERE id=?", (tid,))
+            GLib.idle_add(self._build_content)
+        _confirm_delete(self._win, "Delete task?", "This task will be permanently removed.", _do)
 
     def _refresh(self):
         self._build_content()
@@ -3004,9 +3027,11 @@ class GoalsView(Gtk.Box):
         self._refresh()
 
     def _delete(self, gid):
-        with get_db() as c:
-            c.execute("DELETE FROM goal WHERE id=?", (gid,))
-        self._refresh()
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM goal WHERE id=?", (gid,))
+            self._refresh()
+        _confirm_delete(self._win, "Delete goal?", "This goal will be permanently removed.", _do)
 
 
 class TagsView(Gtk.Box):
@@ -3369,9 +3394,11 @@ class NotesView(Gtk.Box):
         self._refresh()
 
     def _delete(self, nid):
-        with get_db() as c:
-            c.execute("DELETE FROM note WHERE id=?", (nid,))
-        self._refresh()
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM note WHERE id=?", (nid,))
+            self._refresh()
+        _confirm_delete(self._win, "Delete note?", "This note will be permanently removed.", _do)
 
 
 class FilesView(Gtk.Box):
@@ -3449,9 +3476,12 @@ class FilesView(Gtk.Box):
         Gio.AppInfo.launch_default_for_uri(uri, None)
 
     def _delete(self, fid):
-        with get_db() as c:
-            c.execute("DELETE FROM file WHERE id=?", (fid,))
-        GLib.idle_add(self._refresh)
+        def _do():
+            with get_db() as c:
+                c.execute("DELETE FROM file WHERE id=?", (fid,))
+            GLib.idle_add(self._refresh)
+        _confirm_delete(self._win, "Delete file link?",
+                        "The link will be removed. The file on disk is not affected.", _do)
 
 
 # ══════════════════════════════════════════════════════
@@ -4971,10 +5001,13 @@ class MainWindow(Adw.ApplicationWindow):
             del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
             del_btn.set_valign(Gtk.Align.CENTER)
 
-            def _delete_group(_, gid=gid):
-                db_delete_group(gid)
-                self._collapsed_groups.discard(gid)
-                self.refresh_projects()
+            def _delete_group(_, gid=gid, gname=g["name"]):
+                def _do(gid=gid):
+                    db_delete_group(gid)
+                    self._collapsed_groups.discard(gid)
+                    self.refresh_projects()
+                _confirm_delete(self, "Delete group?",
+                                "\"" + gname + "\" will be removed. Projects in it won't be deleted.", lambda: _do())
 
             del_btn.connect("clicked", _delete_group)
             hinner.append(arrow_lbl); hinner.append(name_lbl); hinner.append(del_btn)
