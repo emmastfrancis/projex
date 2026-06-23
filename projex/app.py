@@ -22,6 +22,9 @@ STATUSES = ["active", "paused", "done", "archived"]
 PRIORITIES = ["normal", "high", "low"]
 ENTRY_STATUSES = ["draft", "done"]
 MSTATUSES = ["pending", "active", "done", "blocked"]
+RECUR_OPTIONS = ["Don't repeat", "Every day", "Every 2 days", "Every weekday",
+                 "Every week", "Every 2 weeks", "Every month", "Every year"]
+RECUR_DAYS    = [0, 1, 2, 5, 7, 14, 30, 365]
 
 APP_CSS = """
 .priority-bar { border-radius: 3px; min-width: 4px; }
@@ -879,7 +882,7 @@ def section_page(title, content_widget, extra_header_widgets=None):
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -889,6 +892,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._tasks = tasks or []
         self._show_tasks = show_tasks
         self._zoom = max(0.5, min(4.0, zoom))
+        self._label_w_base = label_w_base
         row_h = int(36 * self._zoom)
         self.set_content_height(max(80, len(items) * row_h + int(48 * self._zoom)))
         self.set_hexpand(True)
@@ -911,7 +915,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         z = self._zoom
         ROW_H  = int(36 * z)
         HDR_H  = int(28 * z)
-        LABEL_W = int(170 * min(z, 1.5))  # label column grows a bit with zoom but caps
+        LABEL_W = int(self._label_w_base * min(z, 1.5))  # label column grows a bit with zoom but caps
         PAD = 10
 
         if self._view_start and self._view_end:
@@ -952,7 +956,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
                 cr.set_source_rgba(0.48, 0.52, 0.60, 0.40 if is_jan else 0.18)
                 cr.move_to(x, 0); cr.line_to(x, height); cr.stroke()
                 cr.set_source_rgba(0.78, 0.82, 0.88, 1.0 if is_jan else 0.65)
-                cr.set_font_size((10 if not is_jan else 11) * z)
+                cr.set_font_size((13 if not is_jan else 14) * z)
                 cr.move_to(x + 3, HDR_H * 0.65)
                 cr.show_text(cur.strftime("%Y" if is_jan else "%b"))
                 cur = datetime(cur.year + (cur.month == 12), (cur.month % 12) + 1, 1)
@@ -970,7 +974,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
                     cr.set_source_rgba(0.48, 0.52, 0.60, 0.40 if is_q1 else 0.15)
                     cr.move_to(x, 0); cr.line_to(x, height); cr.stroke()
                     cr.set_source_rgba(0.78, 0.82, 0.88, 1.0 if is_q1 else 0.55)
-                    cr.set_font_size((11 if is_q1 else 9) * z)
+                    cr.set_font_size((13 if is_q1 else 11) * z)
                     cr.move_to(x + 3, HDR_H * 0.65)
                     cr.show_text(qlbl)
 
@@ -981,7 +985,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
             cr.set_source_rgba(0.93, 0.34, 0.20, 0.90)
             cr.set_line_width(1.5)
             cr.move_to(tx, 0); cr.line_to(tx, height); cr.stroke()
-            cr.set_font_size(9 * z)
+            cr.set_font_size(11 * z)
             cr.move_to(tx + 3, HDR_H * 0.40); cr.show_text("today")
 
         bar_pos = {}
@@ -1001,7 +1005,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
 
             label_text = item.get("text") or item.get("title") or ""
             label = label_text[:22] + "…" if len(label_text) > 22 else label_text
-            cr.set_font_size(12 * z)
+            cr.set_font_size(14 * z)
             cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
             cr.move_to(strip_w + 4, y + ROW_H / 2 + 4 * z)
             cr.show_text(label)
@@ -1069,7 +1073,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         # Task due-date markers (vertical white lines, like the today line)
         if self._tasks and self._show_tasks:
             cr.set_line_width(1.0)
-            cr.set_font_size(10 * z)
+            cr.set_font_size(12 * z)
             for task in self._tasks:
                 dd = task.get("due_date") or ""
                 if not dd:
@@ -1128,6 +1132,17 @@ class GanttChart(Gtk.Box):
         zoom_lbl = Gtk.Label(label="Zoom", valign=Gtk.Align.CENTER)
         zoom_lbl.add_css_class("caption")
 
+        self._label_w = 170
+        self._lw_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 80, 400, 10)
+        self._lw_scale.set_value(170)
+        self._lw_scale.set_draw_value(False)
+        self._lw_scale.set_size_request(120, -1)
+        self._lw_scale.set_valign(Gtk.Align.CENTER)
+        self._lw_scale.set_tooltip_text("Goal name column width")
+        self._lw_scale.connect("value-changed", self._on_lw_change)
+        lw_lbl = Gtk.Label(label="Name width", valign=Gtk.Align.CENTER)
+        lw_lbl.add_css_class("caption")
+
         hdr = Gtk.Box(spacing=10, margin_bottom=2)
         hdr.append(Gtk.Label(label="View:"))
         hdr.append(self._year_drop)
@@ -1141,6 +1156,11 @@ class GanttChart(Gtk.Box):
         hdr.append(sep2)
         hdr.append(zoom_lbl)
         hdr.append(self._zoom_scale)
+        sep3 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep3.set_margin_start(4); sep3.set_margin_end(4)
+        hdr.append(sep3)
+        hdr.append(lw_lbl)
+        hdr.append(self._lw_scale)
         self.append(hdr)
 
         self._chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1166,6 +1186,10 @@ class GanttChart(Gtk.Box):
 
     def _on_zoom(self, scale):
         self._zoom = scale.get_value()
+        GLib.idle_add(self._rebuild)
+
+    def _on_lw_change(self, scale):
+        self._label_w = int(scale.get_value())
         GLib.idle_add(self._rebuild)
 
     def _rebuild(self):
@@ -1221,7 +1245,7 @@ class GanttChart(Gtk.Box):
                 ).fetchall()
         tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom, label_w_base=self._label_w)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
@@ -1237,7 +1261,7 @@ class GanttChart(Gtk.Box):
                 span_days = 365
         except Exception:
             span_days = 365
-        LABEL_W = int(170 * min(self._zoom, 1.5))
+        LABEL_W = int(self._label_w * min(self._zoom, 1.5))
         base_w = LABEL_W + 20 + int(span_days * 3 * self._zoom)
         da.set_content_width(max(900, base_w))
 
@@ -1653,6 +1677,19 @@ class GoalEditDialog(Adw.Window):
         btn.connect("clicked", self._save)
         box.append(btn)
 
+        if self._goal:
+            conv_btn = Gtk.Button(label="Convert to task")
+            conv_btn.add_css_class("flat")
+            conv_btn.set_margin_top(4)
+            conv_btn.connect("clicked", self._convert_to_task)
+            box.append(conv_btn)
+
+            del_btn = Gtk.Button(label="Delete goal")
+            del_btn.add_css_class("destructive-action")
+            del_btn.set_margin_top(4)
+            del_btn.connect("clicked", self._delete_goal)
+            box.append(del_btn)
+
         scroll.set_child(box)
         tv.set_content(scroll)
         self.set_content(tv)
@@ -1680,7 +1717,13 @@ class GoalEditDialog(Adw.Window):
 
     def _entry_changed(self, which):
         if self._guard: return
-        if which != self._cal_target: return
+        if which != self._cal_target:
+            # Auto-fill start_date from end_date when start is empty
+            if which == "end" and not self._start.get_text().strip():
+                self._guard = True
+                self._start.set_text(self._end.get_text())
+                self._guard = False
+            return
         val = self._start.get_text() if which == "start" else self._end.get_text()
         self._guard = True; self._cal_set(val); self._guard = False
 
@@ -1726,6 +1769,30 @@ class GoalEditDialog(Adw.Window):
                     (self._pid, name, status, priority, tags, notes, start, end,
                      due_date, linked_note)
                 )
+        if self._on_save: self._on_save()
+        self.close()
+
+    def _convert_to_task(self, _):
+        if not self._goal: return
+        g = self._goal
+        with get_db() as c:
+            new_pos = c.execute(
+                "SELECT COALESCE(MAX(order_pos)+1,0) FROM todo WHERE project_id=? AND done=0",
+                (self._pid,)).fetchone()[0]
+            c.execute(
+                "INSERT INTO todo (project_id,text,priority,tags,order_pos,due_date,done)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (self._pid, safe_col(g,"text") or "", safe_col(g,"priority") or "normal",
+                 safe_col(g,"tags") or "", new_pos, safe_col(g,"end_date") or "", 1 if g["done"] else 0)
+            )
+            c.execute("DELETE FROM goal WHERE id=?", (g["id"],))
+        if self._on_save: self._on_save()
+        self.close()
+
+    def _delete_goal(self, _):
+        if not self._goal: return
+        with get_db() as c:
+            c.execute("DELETE FROM goal WHERE id=?", (self._goal["id"],))
         if self._on_save: self._on_save()
         self.close()
 
@@ -1851,14 +1918,19 @@ class TodoEditDialog(Adw.Window):
         pri_row.add_suffix(self._pri)
         grp.add(pri_row)
 
-        recur_row = Adw.ActionRow(title="Repeat", subtitle="Auto-recreate N days after completion (0 = no repeat)")
-        recur_box = Gtk.Box(spacing=6)
-        self._recur_spin = Gtk.SpinButton.new_with_range(0, 365, 1)
-        self._recur_spin.set_valign(Gtk.Align.CENTER)
-        self._recur_spin.set_value(int(safe_col(todo, "recur_days") or 0))
-        recur_box.append(self._recur_spin)
-        recur_box.append(Gtk.Label(label="days", valign=Gtk.Align.CENTER))
-        recur_row.add_suffix(recur_box)
+        recur_row = Adw.ActionRow(title="Repeat")
+        self._recur_drop = Gtk.DropDown.new_from_strings(RECUR_OPTIONS)
+        self._recur_drop.set_valign(Gtk.Align.CENTER)
+        # Set current value
+        cur_recur = int(safe_col(todo, "recur_days") or 0)
+        sel = 0
+        for i, d in enumerate(RECUR_DAYS):
+            if d == cur_recur:
+                sel = i; break
+            if d > cur_recur and i > 0:  # pick closest
+                sel = i - 1; break
+        self._recur_drop.set_selected(sel)
+        recur_row.add_suffix(self._recur_drop)
         grp.add(recur_row)
 
         self._recur_end = Adw.EntryRow(title="Stop repeating after (date, optional)")
@@ -1979,6 +2051,20 @@ class TodoEditDialog(Adw.Window):
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
         box.append(btn)
+
+        if self._todo:
+            conv_btn = Gtk.Button(label="Convert to goal")
+            conv_btn.add_css_class("flat")
+            conv_btn.set_margin_top(4)
+            conv_btn.connect("clicked", self._convert_to_goal)
+            box.append(conv_btn)
+
+        del_btn = Gtk.Button(label="Delete task")
+        del_btn.add_css_class("destructive-action")
+        del_btn.set_margin_top(4)
+        del_btn.connect("clicked", self._delete_task)
+        box.append(del_btn)
+
         scroll.set_child(box)
         tv.set_content(scroll)
         self.set_content(tv)
@@ -1989,7 +2075,7 @@ class TodoEditDialog(Adw.Window):
             return
         tags       = normalize_tag_input(self._tags.get_text())
         priority   = PRIORITIES[self._pri.get_selected()]
-        recur_days = int(self._recur_spin.get_value())
+        recur_days = RECUR_DAYS[self._recur_drop.get_selected()]
         recur_end_date = parse_natural_date(self._recur_end.get_text().strip()) if self._recur_end.get_text().strip() else ""
         due_date   = parse_natural_date(self._due.get_text().strip()) or None
         goal_id = self._goal_ids[self._goal_drop.get_selected()]
@@ -2000,6 +2086,26 @@ class TodoEditDialog(Adw.Window):
             )
         if self._on_save:
             self._on_save()
+        self.close()
+
+    def _convert_to_goal(self, _):
+        t = self._todo
+        with get_db() as c:
+            c.execute(
+                "INSERT INTO goal (project_id,text,priority,tags,end_date,done,status)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (t["project_id"], safe_col(t,"text") or "", safe_col(t,"priority") or "normal",
+                 safe_col(t,"tags") or "", safe_col(t,"due_date") or "",
+                 1 if t["done"] else 0, "done" if t["done"] else "active")
+            )
+            c.execute("DELETE FROM todo WHERE id=?", (t["id"],))
+        if self._on_save: self._on_save()
+        self.close()
+
+    def _delete_task(self, _):
+        with get_db() as c:
+            c.execute("DELETE FROM todo WHERE id=?", (self._todo["id"],))
+        if self._on_save: self._on_save()
         self.close()
 
 
@@ -2081,14 +2187,10 @@ class TodosView(Gtk.Box):
         self._entry_due.connect("entry-activated", lambda _: self._on_add(self._entry))
         add_grp.add(self._entry_due)
 
-        recur_add_row = Adw.ActionRow(title="Repeat", subtitle="Days between recurrences (0 = no repeat)")
-        recur_add_box = Gtk.Box(spacing=6)
-        self._entry_recur = Gtk.SpinButton.new_with_range(0, 365, 1)
+        recur_add_row = Adw.ActionRow(title="Repeat")
+        self._entry_recur = Gtk.DropDown.new_from_strings(RECUR_OPTIONS)
         self._entry_recur.set_valign(Gtk.Align.CENTER)
-        self._entry_recur.set_value(0)
-        recur_add_box.append(self._entry_recur)
-        recur_add_box.append(Gtk.Label(label="days", valign=Gtk.Align.CENTER))
-        recur_add_row.add_suffix(recur_add_box)
+        recur_add_row.add_suffix(self._entry_recur)
         add_grp.add(recur_add_row)
 
         add_task_btn = Gtk.Button(label="Add task")
@@ -2098,6 +2200,41 @@ class TodosView(Gtk.Box):
         add_grp.set_header_suffix(add_task_btn)
 
         self.append(add_grp)
+
+        # ── Calendar for due date in add-task group ───────────
+        self._add_cal = Gtk.Calendar()
+        self._add_cal.add_css_class("card")
+        self._add_cal.set_margin_top(4)
+        _add_cal_guard = [False]
+        _no_sc = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
+        _no_sc.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        _no_sc.connect("scroll", lambda _c, _dx, _dy: True)
+        self._add_cal.add_controller(_no_sc)
+
+        def _add_cal_selected(cal):
+            if _add_cal_guard[0]: return
+            gdt = cal.get_date()
+            ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
+            _add_cal_guard[0] = True
+            self._entry_due.set_text(ds)
+            _add_cal_guard[0] = False
+
+        def _add_due_text_changed(*_):
+            if _add_cal_guard[0]: return
+            val = parse_natural_date(self._entry_due.get_text().strip())
+            if val:
+                try:
+                    dt = datetime.strptime(val, "%Y-%m-%d")
+                    _add_cal_guard[0] = True
+                    self._add_cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+                    _add_cal_guard[0] = False
+                except Exception:
+                    pass
+
+        self._add_cal.connect("day-selected", _add_cal_selected)
+        self._entry_due.connect("notify::text", _add_due_text_changed)
+        self.append(self._add_cal)
 
         # ── Tag filter chips (rebuilt each time) ─────────────
         self._chips_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
@@ -2144,7 +2281,6 @@ class TodosView(Gtk.Box):
     # ── Build ──────────────────────────────────────────────────
 
     def _on_tag_filter(self, tag, active):
-        self._filter_tag = tag if active else None
         if active:
             self._filter_tags.add(tag)
         else:
@@ -2428,7 +2564,7 @@ class TodosView(Gtk.Box):
                 existing.add(t)
             tags = " ".join(sorted(existing))
         priority   = PRIORITIES[self._entry_pri.get_selected()]
-        recur_days = int(self._entry_recur.get_value())
+        recur_days = RECUR_DAYS[self._entry_recur.get_selected()]
         due_date   = expand_date_shortcut(self._entry_due.get_text().strip()) or None
         with get_db() as c:
             new_pos = c.execute(
@@ -2442,9 +2578,9 @@ class TodosView(Gtk.Box):
         entry.set_text("")
         self._entry_tags.set_text("")
         self._entry_due.set_text("")
-        self._entry_recur.set_value(0)
+        self._entry_recur.set_selected(0)
         self._build_content()
-        GLib.idle_add(self._entry.grab_focus)
+        GLib.timeout_add(80, lambda: (self._entry.grab_focus(), False)[1])
 
     def _reorder_todo(self, drag_id, drop_id):
         if drag_id == drop_id:
