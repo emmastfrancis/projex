@@ -48,6 +48,7 @@ APP_CSS = """
 .priority-low-lbl { color: #3584e4; }
 .drag-target-row { margin-top: 44px; }
 row { transition: margin-top 200ms ease; }
+calendar .day-with-events indicator { background-color: #e01b24; border-radius: 999px; }
 """
 
 COLOR_PALETTE = [
@@ -891,6 +892,18 @@ def section_page(title, content_widget, extra_header_widgets=None):
 # Gantt chart
 # ══════════════════════════════════════════════════════
 
+# Jewel-tone palette that pops on the dark Gantt background
+GANTT_PALETTE = [
+    (0.31, 0.76, 0.97, 0.88),  # sky blue
+    (0.40, 0.82, 0.67, 0.88),  # emerald
+    (0.98, 0.61, 0.35, 0.88),  # coral-orange
+    (0.71, 0.50, 0.92, 0.88),  # soft violet
+    (0.35, 0.81, 0.77, 0.88),  # teal
+    (0.97, 0.79, 0.28, 0.88),  # golden amber
+    (0.94, 0.43, 0.63, 0.88),  # rose
+    (0.60, 0.85, 0.40, 0.88),  # lime green
+]
+
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
@@ -924,11 +937,17 @@ class _GanttDrawArea(Gtk.DrawingArea):
         motion.connect("motion", self._on_divider_motion)
         self.add_controller(motion)
 
-    def _bar_color(self, item):
+    def _bar_color(self, item, idx=0):
         status = compute_goal_status(item)
         if status == "overdue":
             return (0.88, 0.11, 0.14, 0.92)
-        return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
+        r, g, b, a = GANTT_PALETTE[idx % len(GANTT_PALETTE)]
+        if status == "done":
+            # Desaturate done bars so they read as finished
+            avg = (r + g + b) / 3
+            f = 0.45
+            return (r * f + avg * (1 - f), g * f + avg * (1 - f), b * f + avg * (1 - f), 0.60)
+        return (r, g, b, a)
 
     def _at_divider(self, x):
         return abs(x - int(self._label_w_base * min(self._zoom, 1.5))) <= 8
@@ -1083,7 +1102,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
             if item_id:
                 bar_pos[item_id] = (x_of(d1), x_of(d2), mid)
 
-            bar_rgba = self._bar_color(item)
+            bar_rgba = self._bar_color(item, i)
 
             def _rounded_rect(cx, cy, cw, ch, cr_r):
                 cr.move_to(cx + cr_r, cy)
@@ -1123,32 +1142,6 @@ class _GanttDrawArea(Gtk.DrawingArea):
                     cr.move_to(bx + bw - 10 * z, by + bh - 2); cr.show_text("▶")
 
 
-        # Task due-date markers (vertical white lines, like the today line)
-        if self._tasks and self._show_tasks:
-            cr.set_line_width(1.0)
-            cr.set_font_size(12 * z)
-            for task in self._tasks:
-                dd = task.get("due_date") or ""
-                if not dd:
-                    continue
-                try:
-                    td = datetime.strptime(dd, "%Y-%m-%d")
-                except ValueError:
-                    continue
-                if self._view_start and self._view_end and (td < self._view_start or td > self._view_end):
-                    continue
-                tx = x_of(td)
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.30)
-                cr.move_to(tx, HDR_H)
-                cr.line_to(tx, height)
-                cr.stroke()
-                label = (task.get("text") or "")[:18]
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.50)
-                cr.save()
-                cr.translate(tx + 3 * z, HDR_H + 14 * z)
-                cr.rotate(math.pi / 2)
-                cr.show_text(label)
-                cr.restore()
 
 
 class GanttChart(Gtk.Box):
@@ -1169,12 +1162,6 @@ class GanttChart(Gtk.Box):
         self._year_drop.set_selected(0)  # default: All (show every goal regardless of year)
         self._year_drop.connect("notify::selected", lambda d, _: GLib.idle_add(self._rebuild))
 
-        self._show_tasks = True
-        self._tasks_switch = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
-        self._tasks_switch.connect("notify::active", self._on_tasks_toggle)
-        tasks_lbl = Gtk.Label(label="Show task lines", valign=Gtk.Align.CENTER)
-        tasks_lbl.add_css_class("caption")
-
         self._zoom = 1.0
         self._zoom_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.5, 3.0, 0.25)
         self._zoom_scale.set_value(1.0)
@@ -1193,11 +1180,6 @@ class GanttChart(Gtk.Box):
         sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
         sep1.set_margin_start(4); sep1.set_margin_end(4)
         hdr.append(sep1)
-        hdr.append(tasks_lbl)
-        hdr.append(self._tasks_switch)
-        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        sep2.set_margin_start(4); sep2.set_margin_end(4)
-        hdr.append(sep2)
         hdr.append(zoom_lbl)
         hdr.append(self._zoom_scale)
         self.append(hdr)
@@ -1218,10 +1200,6 @@ class GanttChart(Gtk.Box):
             return start, _months_later(start, 6)
         y = int(opt)
         return datetime(y, 1, 1), datetime(y, 12, 31)
-
-    def _on_tasks_toggle(self, sw, _param=None):
-        self._show_tasks = sw.get_active()
-        GLib.idle_add(self._rebuild)
 
     def _on_zoom(self, scale):
         self._zoom = scale.get_value()
@@ -1268,23 +1246,7 @@ class GanttChart(Gtk.Box):
             project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
-        # Fetch tasks with due dates for this project (or all projects)
-        if self._pid is None:
-            with get_db() as c:
-                task_rows = c.execute(
-                    "SELECT t.text, t.due_date, t.priority, p.color AS project_color "
-                    "FROM todo t JOIN project p ON t.project_id=p.id "
-                    "WHERE t.due_date != '' AND t.done=0 AND p.status != 'archived'"
-                ).fetchall()
-        else:
-            with get_db() as c:
-                task_rows = c.execute(
-                    "SELECT text, due_date, priority FROM todo WHERE project_id=? AND due_date != '' AND done=0",
-                    (self._pid,)
-                ).fetchall()
-        tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
-
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
@@ -2254,16 +2216,32 @@ class TodosView(Gtk.Box):
         self._pick_rev.set_child(pick_box)
         self.append(self._pick_rev)
 
-        # ── Add task button ───────────────────────────────────
-        hdr = Gtk.Box(spacing=8, margin_bottom=4)
+        # ── Due-date calendar + add button ────────────────────
+        cal_hdr = Gtk.Box(spacing=8, margin_bottom=4)
         add_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add task (Ctrl+N)")
         add_btn.add_css_class("suggested-action")
         add_btn.add_css_class("circular")
-        add_btn.set_halign(Gtk.Align.END)
-        add_btn.set_hexpand(True)
+        add_btn.set_valign(Gtk.Align.CENTER)
         add_btn.connect("clicked", lambda _: self._new_task_dialog())
-        hdr.append(add_btn)
-        self.append(hdr)
+        cal_title = Gtk.Label(label="Due dates", xalign=0, hexpand=True)
+        cal_title.add_css_class("heading")
+        cal_hdr.append(cal_title)
+        cal_hdr.append(add_btn)
+        self.append(cal_hdr)
+
+        self._due_cal = Gtk.Calendar()
+        self._due_cal.add_css_class("card")
+        # Block scroll from accidentally changing the month
+        _no_sc = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
+        _no_sc.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        _no_sc.connect("scroll", lambda _c, _dx, _dy: True)
+        self._due_cal.add_controller(_no_sc)
+        self._due_cal.connect("next-month", lambda _: self._mark_due_days())
+        self._due_cal.connect("prev-month", lambda _: self._mark_due_days())
+        self._due_cal.connect("next-year",  lambda _: self._mark_due_days())
+        self._due_cal.connect("prev-year",  lambda _: self._mark_due_days())
+        self.append(self._due_cal)
 
         # ── Tag filter chips (rebuilt each time) ─────────────
         self._chips_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
@@ -2310,6 +2288,23 @@ class TodosView(Gtk.Box):
     def _new_task_dialog(self):
         TodoEditDialog(self._win, {"text": "", "priority": "normal", "project_id": self._pid},
                        on_save=self._build_content).present()
+
+    def _mark_due_days(self):
+        self._due_cal.clear_marks()
+        gdt = self._due_cal.get_date()
+        yr, mo = gdt.get_year(), gdt.get_month()
+        with get_db() as c:
+            rows = c.execute(
+                "SELECT due_date FROM todo WHERE project_id=? AND done=0 AND due_date!=''",
+                (self._pid,)
+            ).fetchall()
+        for row in rows:
+            try:
+                d = datetime.strptime(row["due_date"], "%Y-%m-%d").date()
+                if d.year == yr and d.month == mo:
+                    self._due_cal.mark_day(d.day)
+            except ValueError:
+                pass
 
     # ── Build ──────────────────────────────────────────────────
 
@@ -2450,6 +2445,8 @@ class TodosView(Gtk.Box):
                 _lbl.set_markup(f"<small>{arrow}  {_n} completed task{'s' if _n != 1 else ''}</small>")
 
             toggle_btn.connect("clicked", on_toggle)
+
+        self._mark_due_days()
 
     def _make_row(self, t, is_done):
         row = Adw.ActionRow()
@@ -2847,6 +2844,14 @@ class GoalsView(Gtk.Box):
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
         self._pid = pid; self._win = win; self._push_fn = push_fn
 
+        # Gantt chart at the top (always visible when goals exist)
+        project = db_project(self._pid)
+        gantt_lbl = Gtk.Label(label="Timeline", xalign=0)
+        gantt_lbl.add_css_class("heading")
+        self.append(gantt_lbl)
+        self._gantt = GanttChart(self._pid, project, self._win)
+        self.append(self._gantt)
+
         tb = tip_banner("goals_v2",
             "Goals act as milestones on the Gantt chart — set a start and end date to see them plotted. "
             "Assign tasks to a goal to group them. Use +7d / +2w in date fields as shortcuts.")
@@ -3030,14 +3035,6 @@ class GoalsView(Gtk.Box):
             self._content.append(done_toggle_btn)
             self._content.append(done_rev)
 
-        goals_with_dates = [g for g in goals if safe_col(g, "start_date") and safe_col(g, "end_date")]
-        if goals_with_dates:
-            gantt_lbl = Gtk.Label(label="Timeline", xalign=0, margin_top=8)
-            gantt_lbl.add_css_class("heading")
-            self._content.append(gantt_lbl)
-            project = db_project(self._pid)
-            gantt = GanttChart(self._pid, project, self._win)
-            self._content.append(gantt)
 
     def _toggle_done(self, gid, done):
         with get_db() as c:
