@@ -1054,11 +1054,14 @@ class _GanttDrawArea(Gtk.DrawingArea):
                 strip_w = 9
 
             label_text = item.get("text") or item.get("title") or ""
-            label = label_text[:22] + "…" if len(label_text) > 22 else label_text
             cr.set_font_size(14 * z)
             cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
+            cr.save()
+            cr.rectangle(strip_w, y, LABEL_W - strip_w - 6, ROW_H)
+            cr.clip()
             cr.move_to(strip_w + 4, y + ROW_H / 2 + 4 * z)
-            cr.show_text(label)
+            cr.show_text(label_text)
+            cr.restore()
 
             try:
                 d1 = datetime.strptime(item["start_date"], "%Y-%m-%d")
