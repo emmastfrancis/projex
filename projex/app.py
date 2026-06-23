@@ -42,6 +42,7 @@ APP_CSS = """
 .overdue-project-row .title { color: #e01b24; }
 .proj-bold-row .title { font-weight: bold; }
 .priority-normal-lbl { color: #f5c211; }
+.priority-low-lbl { color: #3584e4; }
 """
 
 COLOR_PALETTE = [
@@ -666,6 +667,27 @@ def db_search(query):
     return results[:60]
 
 
+def compute_goal_status(g, linked_tasks=None):
+    """Return 'done'|'active'|'future'|'overdue' by inspecting dates and tasks."""
+    if g["done"]:
+        return "done"
+    today_s = date.today().isoformat()
+    start = safe_col(g, "start_date") or ""
+    end   = safe_col(g, "end_date") or ""
+    if end and end < today_s:
+        if linked_tasks is None:
+            with get_db() as c:
+                linked_tasks = c.execute(
+                    "SELECT done FROM todo WHERE goal_id=?", (g["id"],)
+                ).fetchall()
+        if any(not t["done"] for t in linked_tasks):
+            return "overdue"
+        return "done"  # all tasks done even if end passed
+    if start and start > today_s:
+        return "future"
+    return "active"
+
+
 def project_health(pid):
     """Return ('green'|'yellow'|'red', reason_string) for a project."""
     today = date.today()
@@ -674,15 +696,8 @@ def project_health(pid):
 
     overdue_goals = []
     for g in goals:
-        if g["done"] or safe_col(g, "status") == "done":
-            continue
-        end = safe_col(g, "end_date")
-        if end:
-            try:
-                if datetime.strptime(end, "%Y-%m-%d").date() < today:
-                    overdue_goals.append(g["text"])
-            except ValueError:
-                pass
+        if compute_goal_status(g) == "overdue":
+            overdue_goals.append(g["text"])
 
     overdue_tasks = [t for t in todos if not t["done"] and safe_col(t, "due_date")
                      and safe_col(t, "due_date") < today.isoformat()]
@@ -881,13 +896,12 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self.set_draw_func(self._draw)
 
     def _bar_color(self, item):
-        status = safe_col(item, "status") or ""
-        done = bool(item.get("done"))
-        if done or status == "done":
+        status = compute_goal_status(item)
+        if status == "done":
             return (0.15, 0.63, 0.41, 0.92)   # green
-        if status == "blocked":
+        if status == "overdue":
             return (0.88, 0.11, 0.14, 0.92)   # red
-        # active, pending, or no status → accent (project colour)
+        # active, future → accent (project colour)
         return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
 
     def _draw(self, area, cr, width, height):
@@ -1513,14 +1527,6 @@ class GoalEditDialog(Adw.Window):
         self._tags_row.set_text(safe_col(goal, "tags") if goal else "")
         fields.add(self._tags_row)
 
-        st_row = Adw.ActionRow(title="Status")
-        self._status = Gtk.DropDown.new_from_strings(MSTATUSES)
-        self._status.set_valign(Gtk.Align.CENTER)
-        cur_st = safe_col(goal, "status") if goal else "pending"
-        self._status.set_selected(MSTATUSES.index(cur_st) if cur_st in MSTATUSES else 0)
-        st_row.add_suffix(self._status)
-        fields.add(st_row)
-
         pri_row = Adw.ActionRow(title="Priority")
         self._pri = Gtk.DropDown.new_from_strings(PRIORITIES)
         self._pri.set_valign(Gtk.Align.CENTER)
@@ -1681,13 +1687,16 @@ class GoalEditDialog(Adw.Window):
     def _save(self, *_):
         name = self._name.get_text().strip()
         if not name: return
-        status   = MSTATUSES[self._status.get_selected()]
         priority = PRIORITIES[self._pri.get_selected()]
         tags     = normalize_tag_input(self._tags_row.get_text())
         notes    = self._notes_row.get_text().strip()
         start    = expand_date_shortcut(self._start.get_text().strip()) or ""
         end      = expand_date_shortcut(self._end.get_text().strip()) or ""
-        done     = 1 if status == "done" else 0
+        done_flag = 1 if (self._goal and self._goal["done"]) else 0
+        gid_for_status = self._goal["id"] if self._goal else -1
+        status   = compute_goal_status({"done": done_flag, "start_date": start,
+                                        "end_date": end, "id": gid_for_status})
+        done     = 1 if (done_flag or status == "done") else 0
         due_date = end
         linked_note = self._note_ids[self._note_drop.get_selected()]
 
@@ -2337,7 +2346,11 @@ class TodosView(Gtk.Box):
                 due_part = f"Due {due_str}"
         sub_parts = []
         if due_part:
-            sub_parts.append(f"<i>{GLib.markup_escape_text(due_part)}</i>")
+            if due_part == "Due today":
+                sub_parts.append('<b><span foreground="#e01b24">Due today</span></b>')
+                row.add_css_class("task-row-high")
+            else:
+                sub_parts.append(f"<i>{GLib.markup_escape_text(due_part)}</i>")
         if recur and not is_done:
             sub_parts.append(f"Repeats every {recur}d")
         if tags_str:
@@ -2568,6 +2581,97 @@ class TodosView(Gtk.Box):
         self._build_content()
 
 
+class GoalDetailView(Gtk.Box):
+    def __init__(self, pid, goal_dict, win, push_fn=None, on_refresh=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                         margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
+        self._pid = pid; self._win = win; self._push_fn = push_fn
+        self._goal = goal_dict; self._on_refresh = on_refresh
+        self._build()
+
+    def _build(self):
+        clear_box(self)
+        g = self._goal
+        # Reload from DB for freshness
+        with get_db() as c:
+            fresh = c.execute("SELECT * FROM goal WHERE id=?", (g["id"],)).fetchone()
+        if fresh:
+            g = {k: fresh[k] for k in fresh.keys()}
+            self._goal = g
+
+        # Info group
+        info_grp = Adw.PreferencesGroup()
+        start = safe_col(g, "start_date"); end = safe_col(g, "end_date")
+        date_row = Adw.ActionRow(title="Timeline",
+                                 subtitle=f"{start} → {end}" if start and end else (end or start or "No dates"))
+        info_grp.add(date_row)
+        notes = safe_col(g, "notes")
+        if notes:
+            notes_row = Adw.ActionRow(title="Notes", subtitle=notes)
+            notes_row.set_subtitle_lines(3)
+            info_grp.add(notes_row)
+        self.append(info_grp)
+
+        # Edit button
+        edit_btn = Gtk.Button(label="Edit goal")
+        edit_btn.add_css_class("suggested-action"); edit_btn.add_css_class("pill")
+        edit_btn.set_halign(Gtk.Align.CENTER)
+        edit_btn.connect("clicked", lambda _: GoalEditDialog(
+            self._win, self._pid, goal=self._goal,
+            on_save=lambda: (self._build(), self._on_refresh() if self._on_refresh else None)
+        ).present())
+        self.append(edit_btn)
+
+        # Linked tasks
+        with get_db() as c:
+            linked = c.execute(
+                "SELECT * FROM todo WHERE goal_id=? ORDER BY done, due_date",
+                (g["id"],)
+            ).fetchall()
+        if linked:
+            task_grp = Adw.PreferencesGroup(title="Tasks")
+            open_n = sum(1 for t in linked if not t["done"])
+            done_n = sum(1 for t in linked if t["done"])
+            task_grp.set_description(f"{open_n} open · {done_n} done")
+            for t in linked:
+                trow = Adw.ActionRow(title=t["text"])
+                if t["done"]:
+                    trow.add_css_class("dim-label")
+                    escaped = GLib.markup_escape_text(t["text"])
+                    trow.set_use_markup(True)
+                    trow.set_title(f"<s>{escaped}</s>")
+                due = t["due_date"] or ""
+                if due:
+                    try:
+                        delta = (datetime.strptime(due, "%Y-%m-%d").date() - date.today()).days
+                        dl = "Due today" if delta == 0 else (f"Overdue {-delta}d" if delta < 0 else f"Due in {delta}d")
+                    except ValueError:
+                        dl = due
+                    trow.set_subtitle(dl)
+                check = Gtk.CheckButton(active=bool(t["done"]))
+                check.set_valign(Gtk.Align.CENTER)
+                tid = t["id"]
+                def _on_toggle(b, _tid=tid):
+                    today_s = date.today().isoformat()
+                    with get_db() as c2:
+                        if b.get_active():
+                            c2.execute("UPDATE todo SET done=1, completed_date=? WHERE id=?", (today_s, _tid))
+                        else:
+                            c2.execute("UPDATE todo SET done=0, completed_date='' WHERE id=?", (_tid,))
+                    GLib.idle_add(self._build)
+                    if self._on_refresh: GLib.idle_add(self._on_refresh)
+                check.connect("toggled", _on_toggle)
+                trow.add_prefix(check)
+                task_grp.add(trow)
+            self.append(task_grp)
+        else:
+            empty = Adw.StatusPage(title="No tasks linked",
+                                   description="Add tasks and assign them to this goal from the Tasks section",
+                                   icon_name="checkbox-checked-symbolic")
+            empty.set_vexpand(False)
+            self.append(empty)
+
+
 class GoalsView(Gtk.Box):
     def __init__(self, pid, win, push_fn=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -2621,8 +2725,7 @@ class GoalsView(Gtk.Box):
         def _make_goal_row(g):
             g_snap = dict(g)
             priority = safe_col(g, "priority") or "normal"
-            status   = safe_col(g, "status")   or "pending"
-            if g["done"]: status = "done"
+            status   = compute_goal_status(g)
             start    = safe_col(g, "start_date")
             end      = safe_col(g, "end_date")
 
@@ -2648,7 +2751,7 @@ class GoalsView(Gtk.Box):
 
             pri_lbl = Gtk.Label(label=priority.upper())
             pri_lbl.add_css_class("caption")
-            _pri_css = {"high": "error", "low": "accent", "normal": "priority-normal-lbl"}
+            _pri_css = {"high": "error", "low": "priority-low-lbl", "normal": "priority-normal-lbl"}
             pri_lbl.add_css_class(_pri_css.get(priority, "dim-label"))
             pri_lbl.set_valign(Gtk.Align.CENTER)
             pri_lbl.set_size_request(52, -1)
@@ -2657,7 +2760,7 @@ class GoalsView(Gtk.Box):
 
             badge = Gtk.Label(label=status)
             badge.add_css_class("caption")
-            badge.add_css_class({"done": "success", "active": "accent", "blocked": "error", "pending": "dim-label"}.get(status, "dim-label"))
+            badge.add_css_class({"done": "success", "active": "accent", "future": "dim-label", "overdue": "error"}.get(status, "dim-label"))
             badge.set_valign(Gtk.Align.CENTER)
             row.add_suffix(badge)
 
@@ -2700,6 +2803,20 @@ class GoalsView(Gtk.Box):
 
             if g["done"]:
                 row.add_css_class("dim-label")
+
+            # Single-click activatable → push GoalDetailView
+            row.set_activatable(True)
+            row.connect("activated", lambda _, gs=g_snap: self._push_fn and self._push_fn(
+                gs["text"][:40],
+                GoalDetailView(self._pid, gs, self._win,
+                               push_fn=self._push_fn, on_refresh=self._refresh)
+            ))
+            # Double-click also pushes GoalDetailView
+            add_dblclick(row, lambda gs=g_snap: self._push_fn and self._push_fn(
+                gs["text"][:40],
+                GoalDetailView(self._pid, gs, self._win,
+                               push_fn=self._push_fn, on_refresh=self._refresh)
+            ))
 
             return row
 
@@ -2747,10 +2864,7 @@ class GoalsView(Gtk.Box):
 
     def _toggle_done(self, gid, done):
         with get_db() as c:
-            if done:
-                c.execute("UPDATE goal SET done=1, status='done' WHERE id=?", (gid,))
-            else:
-                c.execute("UPDATE goal SET done=0, status='active' WHERE id=?", (gid,))
+            c.execute("UPDATE goal SET done=? WHERE id=?", (int(done), gid))
         self._refresh()
 
     def _delete(self, gid):
@@ -3743,6 +3857,90 @@ class PomodoroWidget(Gtk.Box):
             GLib.source_remove(self._source_id); self._source_id = None
 
 
+class ShiftDatesDialog(Adw.Window):
+    def __init__(self, parent, pid, on_save=None):
+        super().__init__(
+            title="Push dates ahead",
+            modal=True, transient_for=parent,
+            default_width=360, default_height=260, resizable=False,
+        )
+        self._pid = pid; self._on_save = on_save
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=16, margin_bottom=24, margin_start=18, margin_end=18)
+
+        grp = Adw.PreferencesGroup(title="Shift all goal and task dates forward")
+
+        # Days spin button
+        days_row = Adw.ActionRow(title="Amount")
+        self._spin = Gtk.SpinButton.new_with_range(1, 365, 1)
+        self._spin.set_value(7)
+        self._spin.set_valign(Gtk.Align.CENTER)
+        days_row.add_suffix(self._spin)
+        grp.add(days_row)
+
+        # Unit dropdown
+        unit_row = Adw.ActionRow(title="Unit")
+        self._unit = Gtk.DropDown.new_from_strings(["days", "weeks", "months"])
+        self._unit.set_valign(Gtk.Align.CENTER)
+        unit_row.add_suffix(self._unit)
+        grp.add(unit_row)
+
+        box.append(grp)
+
+        btn = Gtk.Button(label="Shift all dates")
+        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
+        btn.set_halign(Gtk.Align.CENTER)
+        btn.connect("clicked", self._do_shift)
+        box.append(btn)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_child(box)
+        tv.set_content(scroll)
+        self.set_content(tv)
+
+    def _do_shift(self, _):
+        amount = int(self._spin.get_value())
+        unit_idx = self._unit.get_selected()
+        units = ["days", "weeks", "months"]
+        unit = units[unit_idx]
+        if unit == "weeks":
+            delta_days = amount * 7
+        elif unit == "months":
+            delta_days = amount * 30
+        else:
+            delta_days = amount
+        delta = timedelta(days=delta_days)
+
+        def _shift_date(ds):
+            if not ds:
+                return ds
+            try:
+                return (datetime.strptime(ds, "%Y-%m-%d").date() + delta).isoformat()
+            except ValueError:
+                return ds
+
+        with get_db() as c:
+            for g in c.execute(
+                "SELECT id, start_date, end_date FROM goal WHERE project_id=?", (self._pid,)
+            ).fetchall():
+                new_start = _shift_date(g["start_date"])
+                new_end   = _shift_date(g["end_date"])
+                c.execute("UPDATE goal SET start_date=?, end_date=? WHERE id=?",
+                          (new_start, new_end, g["id"]))
+            for t in c.execute(
+                "SELECT id, due_date FROM todo WHERE project_id=? AND due_date!=''", (self._pid,)
+            ).fetchall():
+                new_due = _shift_date(t["due_date"])
+                c.execute("UPDATE todo SET due_date=? WHERE id=?", (new_due, t["id"]))
+
+        if self._on_save:
+            self._on_save()
+        self.close()
+
+
 class ProjectDetailView(Gtk.Box):
     def __init__(self, pid, window, on_back=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -3798,6 +3996,14 @@ class ProjectDetailView(Gtk.Box):
         export_btn.add_css_class("flat"); export_btn.set_tooltip_text("Export as Markdown")
         export_btn.connect("clicked", self._do_export)
         hdr.pack_end(export_btn)
+
+        # Shift dates button
+        shift_btn = Gtk.Button(icon_name="calendar-symbolic")
+        shift_btn.add_css_class("flat"); shift_btn.set_tooltip_text("Push all dates forward")
+        shift_btn.connect("clicked", lambda _: ShiftDatesDialog(
+            self._win, self._pid, on_save=self._rebuild_tiles
+        ).present())
+        hdr.pack_end(shift_btn)
 
         home_btn = Gtk.Button(icon_name="go-previous-symbolic")
         home_btn.add_css_class("flat")
