@@ -46,6 +46,8 @@ APP_CSS = """
 .proj-bold-row .title { font-weight: bold; }
 .priority-normal-lbl { color: #f5c211; }
 .priority-low-lbl { color: #3584e4; }
+.drag-target-row { margin-top: 44px; }
+row { transition: margin-top 200ms ease; }
 """
 
 COLOR_PALETTE = [
@@ -912,6 +914,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self.set_draw_func(self._draw)
 
         drag = Gtk.GestureDrag.new()
+        drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         drag.connect("drag-begin", self._on_divider_drag_begin)
         drag.connect("drag-update", self._on_divider_drag_update)
         drag.connect("drag-end", self._on_divider_drag_end)
@@ -944,11 +947,11 @@ class _GanttDrawArea(Gtk.DrawingArea):
         new_lw = max(80, min(500, self._drag_start_lw + int(ox / z)))
         if new_lw != self._label_w_base:
             self._label_w_base = new_lw
-            self.queue_draw()
-            if self._on_label_resize:
-                self._on_label_resize(new_lw)
+            self.queue_draw()  # redraw in-place; no rebuild during drag
 
     def _on_divider_drag_end(self, gesture, ox, oy):
+        if self._drag_active and self._on_label_resize:
+            self._on_label_resize(self._label_w_base)  # trigger rebuild only on release
         self._drag_active = False
 
     def _on_divider_motion(self, ctrl, x, y):
@@ -1437,6 +1440,13 @@ class ProjectDialog(Adw.Window):
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
         box.append(btn)
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.LOCAL)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), True)[1]),
+        ))
+        self.add_controller(sc)
         tv.set_content(box)
         self.set_content(tv)
 
@@ -1535,6 +1545,13 @@ class NoteDialog(Adw.Window):
         self._tags_row.connect("entry-activated", self._save)
         tags_grp.add(self._tags_row)
         box.append(tags_grp)
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.LOCAL)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), True)[1]),
+        ))
+        self.add_controller(sc)
         tv.set_content(box); self.set_content(tv)
 
     def _save(self, _):
@@ -1723,6 +1740,13 @@ class GoalEditDialog(Adw.Window):
             del_btn.connect("clicked", self._delete_goal)
             box.append(del_btn)
 
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.LOCAL)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), True)[1]),
+        ))
+        self.add_controller(sc)
         scroll.set_child(box)
         tv.set_content(scroll)
         self.set_content(tv)
@@ -2103,6 +2127,13 @@ class TodoEditDialog(Adw.Window):
             del_btn.connect("clicked", self._delete_task)
             box.append(del_btn)
 
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.LOCAL)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), True)[1]),
+        ))
+        self.add_controller(sc)
         scroll.set_child(box)
         tv.set_content(scroll)
         self.set_content(tv)
@@ -2194,6 +2225,7 @@ class TodosView(Gtk.Box):
         self._selected_ids = set()
         self._row_checks   = {}
         self._filter_tags  = set()
+        self._drag_rows    = {}
         self._sort_by      = "order" # options: "order", "alpha", "priority", "due", "overdue"
 
         tb = tip_banner("tasks",
@@ -2292,6 +2324,7 @@ class TodosView(Gtk.Box):
     def _build_content(self):
         clear_box(self._content)
         self._row_checks.clear()
+        self._drag_rows = {}
         todos  = db_todos(self._pid)
         undone = [t for t in todos if not t["done"]]
         done   = [t for t in todos if t["done"]]
@@ -2418,6 +2451,7 @@ class TodosView(Gtk.Box):
     def _make_row(self, t, is_done):
         row = Adw.ActionRow()
         tid = t["id"]
+        self._drag_rows[tid] = row
 
         # ── Bulk selection checkbox (bulk mode, active tasks only) ──
         if not is_done and self._bulk_mode:
@@ -2441,12 +2475,35 @@ class TodosView(Gtk.Box):
             drag.set_actions(Gdk.DragAction.MOVE)
             drag.connect("prepare", lambda src, x, y, i=tid:
                 Gdk.ContentProvider.new_for_value(str(i)))
+            drag.connect("drag-begin", lambda src, data, r=row: src.set_icon(
+                Gtk.WidgetPaintable.new(r), 0, 0))
             handle.add_controller(drag)
             row.add_prefix(handle)
 
             drop = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
-            drop.connect("drop", lambda tgt, val, x, y, i=tid:
-                (self._reorder_todo(int(val), i), True)[1])
+
+            def _on_drag_motion(tgt, x, y, hov_tid=tid):
+                if getattr(self, '_drag_hover_tid', None) != hov_tid:
+                    prev = getattr(self, '_drag_hover_tid', None)
+                    if prev and prev in self._drag_rows:
+                        self._drag_rows[prev].remove_css_class("drag-target-row")
+                    self._drag_hover_tid = hov_tid
+                    row.add_css_class("drag-target-row")
+                return Gdk.DragAction.MOVE
+
+            def _on_drag_leave(tgt, hov_tid=tid):
+                if getattr(self, '_drag_hover_tid', None) == hov_tid:
+                    row.remove_css_class("drag-target-row")
+                    self._drag_hover_tid = None
+
+            drop.connect("motion", _on_drag_motion)
+            drop.connect("leave", _on_drag_leave)
+            drop.connect("drop", lambda tgt, val, x, y, i=tid: (
+                self._drag_rows.get(i, None) and self._drag_rows[i].remove_css_class("drag-target-row"),
+                setattr(self, '_drag_hover_tid', None),
+                self._reorder_todo(int(val), i),
+                True
+            )[-1])
             row.add_controller(drop)
 
         # ── Title (strikethrough when done) ───────────────────
@@ -2824,7 +2881,9 @@ class GoalsView(Gtk.Box):
 
         grp = Adw.PreferencesGroup(title="Goals")
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.add_css_class("flat")
+        add_btn.add_css_class("suggested-action")
+        add_btn.add_css_class("circular")
+        add_btn.set_tooltip_text("New goal (Ctrl+N)")
         add_btn.connect("clicked", lambda _: GoalEditDialog(self._win, self._pid, on_save=self._refresh).present())
         grp.set_header_suffix(add_btn)
 
@@ -2932,6 +2991,12 @@ class GoalsView(Gtk.Box):
         for g in active_goals:
             grp.add(_make_goal_row(g))
 
+        hint = Gtk.Label()
+        hint.set_markup("<i><span size='small'>Overdue items shown in red</span></i>")
+        hint.set_halign(Gtk.Align.START)
+        hint.add_css_class("dim-label")
+        hint.set_margin_bottom(2)
+        self._content.append(hint)
         self._content.append(grp)
 
         # ── Completed goals (collapsible) ─────────────────────
@@ -3300,7 +3365,9 @@ class NotesView(Gtk.Box):
         title = "Notes" if not q else f"Notes — {len(notes)} match{'es' if len(notes) != 1 else ''}"
         grp = Adw.PreferencesGroup(title=title)
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.add_css_class("flat")
+        add_btn.add_css_class("suggested-action")
+        add_btn.add_css_class("circular")
+        add_btn.set_tooltip_text("New note")
         add_btn.connect("clicked", lambda _: self._open_new())
         grp.set_header_suffix(add_btn)
         if not notes:
@@ -3366,7 +3433,9 @@ class FilesView(Gtk.Box):
         files = db_files(self._pid)
         grp = Adw.PreferencesGroup(title="Linked files")
         add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.add_css_class("flat")
+        add_btn.add_css_class("suggested-action")
+        add_btn.add_css_class("circular")
+        add_btn.set_tooltip_text("Link a file")
         add_btn.connect("clicked", self._pick_file)
         grp.set_header_suffix(add_btn)
         if not files:
@@ -4291,7 +4360,8 @@ class ProjectDetailView(Gtk.Box):
         hdr_widgets = []
         if add_cb:
             add_btn = Gtk.Button(icon_name="list-add-symbolic")
-            add_btn.add_css_class("flat")
+            add_btn.add_css_class("suggested-action")
+            add_btn.add_css_class("circular")
             add_btn.connect("clicked", lambda _: add_cb())
             hdr_widgets.append(add_btn)
         self._nav.push(section_page(title, widget, hdr_widgets or None))
@@ -4698,7 +4768,8 @@ class MainWindow(Adw.ApplicationWindow):
         shdr = Adw.HeaderBar()
         shdr.set_show_end_title_buttons(False)
         new_btn = Gtk.Button(icon_name="list-add-symbolic")
-        new_btn.add_css_class("flat")
+        new_btn.add_css_class("suggested-action")
+        new_btn.add_css_class("circular")
         new_btn.set_tooltip_text("New project")
         new_btn.connect("clicked",
             lambda _: ProjectDialog(self, on_save=self.refresh_projects).present())
