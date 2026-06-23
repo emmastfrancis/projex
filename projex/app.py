@@ -892,7 +892,7 @@ def section_page(title, content_widget, extra_header_widgets=None):
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -903,20 +903,57 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._show_tasks = show_tasks
         self._zoom = max(0.5, min(4.0, zoom))
         self._label_w_base = label_w_base
+        self._on_label_resize = on_label_resize
+        self._drag_active = False
+        self._drag_start_lw = label_w_base
         row_h = int(36 * self._zoom)
         self.set_content_height(max(80, len(items) * row_h + int(48 * self._zoom)))
         self.set_hexpand(True)
-        self.set_can_target(False)
         self.set_draw_func(self._draw)
+
+        drag = Gtk.GestureDrag.new()
+        drag.connect("drag-begin", self._on_divider_drag_begin)
+        drag.connect("drag-update", self._on_divider_drag_update)
+        drag.connect("drag-end", self._on_divider_drag_end)
+        self.add_controller(drag)
+
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect("motion", self._on_divider_motion)
+        self.add_controller(motion)
 
     def _bar_color(self, item):
         status = compute_goal_status(item)
-        if status == "done":
-            return (0.15, 0.63, 0.41, 0.92)   # green
         if status == "overdue":
-            return (0.88, 0.11, 0.14, 0.92)   # red
-        # active, future → accent (project colour)
+            return (0.88, 0.11, 0.14, 0.92)
         return (self._accent.red, self._accent.green, self._accent.blue, 0.92)
+
+    def _at_divider(self, x):
+        return abs(x - int(self._label_w_base * min(self._zoom, 1.5))) <= 8
+
+    def _on_divider_drag_begin(self, gesture, sx, sy):
+        if self._at_divider(sx):
+            self._drag_active = True
+            self._drag_start_lw = self._label_w_base
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        else:
+            self._drag_active = False
+
+    def _on_divider_drag_update(self, gesture, ox, oy):
+        if not self._drag_active: return
+        z = min(self._zoom, 1.5)
+        new_lw = max(80, min(500, self._drag_start_lw + int(ox / z)))
+        if new_lw != self._label_w_base:
+            self._label_w_base = new_lw
+            self.queue_draw()
+            if self._on_label_resize:
+                self._on_label_resize(new_lw)
+
+    def _on_divider_drag_end(self, gesture, ox, oy):
+        self._drag_active = False
+
+    def _on_divider_motion(self, ctrl, x, y):
+        name = "col-resize" if self._at_divider(x) else "default"
+        self.set_cursor(Gdk.Cursor.new_from_name(name))
 
     def _draw(self, area, cr, width, height):
         items = self._items
@@ -1143,15 +1180,6 @@ class GanttChart(Gtk.Box):
         zoom_lbl.add_css_class("caption")
 
         self._label_w = 170
-        self._lw_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 80, 400, 10)
-        self._lw_scale.set_value(170)
-        self._lw_scale.set_draw_value(False)
-        self._lw_scale.set_size_request(120, -1)
-        self._lw_scale.set_valign(Gtk.Align.CENTER)
-        self._lw_scale.set_tooltip_text("Goal name column width")
-        self._lw_scale.connect("value-changed", self._on_lw_change)
-        lw_lbl = Gtk.Label(label="Name width", valign=Gtk.Align.CENTER)
-        lw_lbl.add_css_class("caption")
 
         hdr = Gtk.Box(spacing=10, margin_bottom=2)
         hdr.append(Gtk.Label(label="View:"))
@@ -1166,11 +1194,6 @@ class GanttChart(Gtk.Box):
         hdr.append(sep2)
         hdr.append(zoom_lbl)
         hdr.append(self._zoom_scale)
-        sep3 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        sep3.set_margin_start(4); sep3.set_margin_end(4)
-        hdr.append(sep3)
-        hdr.append(lw_lbl)
-        hdr.append(self._lw_scale)
         self.append(hdr)
 
         self._chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1198,8 +1221,8 @@ class GanttChart(Gtk.Box):
         self._zoom = scale.get_value()
         GLib.idle_add(self._rebuild)
 
-    def _on_lw_change(self, scale):
-        self._label_w = int(scale.get_value())
+    def _on_label_resize_cb(self, new_lw):
+        self._label_w = new_lw
         GLib.idle_add(self._rebuild)
 
     def _rebuild(self):
@@ -1255,7 +1278,7 @@ class GanttChart(Gtk.Box):
                 ).fetchall()
         tasks_list = [{k: r[k] for k in r.keys()} for r in task_rows]
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom, label_w_base=self._label_w)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), tasks=tasks_list, show_tasks=self._show_tasks, zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
@@ -1901,7 +1924,8 @@ class QuickTaskDialog(Adw.Window):
 class TodoEditDialog(Adw.Window):
     def __init__(self, parent, todo, on_save=None):
         super().__init__(
-            title="Edit Task", modal=True, transient_for=parent,
+            title="New Task" if "id" not in todo else "Edit Task",
+            modal=True, transient_for=parent,
             default_width=420, default_height=580, resizable=True,
         )
         self._todo = todo
@@ -1916,7 +1940,7 @@ class TodoEditDialog(Adw.Window):
         grp = Adw.PreferencesGroup()
 
         self._text = Adw.EntryRow(title="Task")
-        self._text.set_text(todo["text"])
+        self._text.set_text(safe_col(todo, "text") or "")
         grp.add(self._text)
 
         self._tags = Adw.EntryRow(title="Labels (e.g. #design #urgent)")
@@ -1926,7 +1950,8 @@ class TodoEditDialog(Adw.Window):
         pri_row = Adw.ActionRow(title="Priority")
         self._pri = Gtk.DropDown.new_from_strings(PRIORITIES)
         self._pri.set_valign(Gtk.Align.CENTER)
-        cur = todo["priority"] if todo["priority"] in PRIORITIES else "normal"
+        cur = safe_col(todo, "priority") or "normal"
+        cur = cur if cur in PRIORITIES else "normal"
         self._pri.set_selected(PRIORITIES.index(cur))
         pri_row.add_suffix(self._pri)
         grp.add(pri_row)
@@ -2065,18 +2090,18 @@ class TodoEditDialog(Adw.Window):
         btn.connect("clicked", self._save)
         box.append(btn)
 
-        if self._todo:
+        if "id" in self._todo:
             conv_btn = Gtk.Button(label="Convert to goal")
             conv_btn.add_css_class("flat")
             conv_btn.set_margin_top(4)
             conv_btn.connect("clicked", self._convert_to_goal)
             box.append(conv_btn)
 
-        del_btn = Gtk.Button(label="Delete task")
-        del_btn.add_css_class("destructive-action")
-        del_btn.set_margin_top(4)
-        del_btn.connect("clicked", self._delete_task)
-        box.append(del_btn)
+            del_btn = Gtk.Button(label="Delete task")
+            del_btn.add_css_class("destructive-action")
+            del_btn.set_margin_top(4)
+            del_btn.connect("clicked", self._delete_task)
+            box.append(del_btn)
 
         scroll.set_child(box)
         tv.set_content(scroll)
@@ -2093,10 +2118,20 @@ class TodoEditDialog(Adw.Window):
         due_date   = parse_natural_date(self._due.get_text().strip()) or None
         goal_id = self._goal_ids[self._goal_drop.get_selected()]
         with get_db() as c:
-            c.execute(
-                "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, recur_end_date=?, due_date=?, goal_id=? WHERE id=?",
-                (text, tags, priority, recur_days, recur_end_date, due_date, goal_id, self._todo["id"]),
-            )
+            if "id" in self._todo:
+                c.execute(
+                    "UPDATE todo SET text=?, tags=?, priority=?, recur_days=?, recur_end_date=?, due_date=?, goal_id=? WHERE id=?",
+                    (text, tags, priority, recur_days, recur_end_date, due_date, goal_id, self._todo["id"]),
+                )
+            else:
+                new_pos = c.execute(
+                    "SELECT COALESCE(MAX(order_pos)+1,0) FROM todo WHERE project_id=? AND done=0",
+                    (self._todo["project_id"],)).fetchone()[0]
+                c.execute(
+                    "INSERT INTO todo (project_id,text,priority,tags,order_pos,recur_days,recur_end_date,due_date,goal_id)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (self._todo["project_id"], text, priority, tags, new_pos, recur_days, recur_end_date, due_date, goal_id),
+                )
         if self._on_save:
             self._on_save()
         self.close()
@@ -2184,73 +2219,16 @@ class TodosView(Gtk.Box):
         self._pick_rev.set_child(pick_box)
         self.append(self._pick_rev)
 
-        # ── Persistent add-entry (top, never rebuilt) ─────────
-        add_grp = Adw.PreferencesGroup(title="Add task")
-        self._entry = Adw.EntryRow(title="Task name")
-        self._entry_pri = Gtk.DropDown.new_from_strings(PRIORITIES)
-        self._entry_pri.set_valign(Gtk.Align.CENTER)
-        self._entry_pri.set_tooltip_text("Priority")
-        self._entry.add_suffix(self._entry_pri)
-        self._entry.connect("entry-activated", self._on_add)
-        add_grp.add(self._entry)
-
-        self._entry_tags = Adw.EntryRow(title="Labels (e.g. #design #urgent, optional)")
-        self._entry_tags.connect("entry-activated", lambda _: self._on_add(self._entry))
-        add_grp.add(self._entry_tags)
-
-        self._entry_due = Adw.EntryRow(title="Due date (e.g. monday, june 5, +7d, optional)")
-        _wire_date_shortcut(self._entry_due)
-        self._entry_due.connect("entry-activated", lambda _: self._on_add(self._entry))
-        add_grp.add(self._entry_due)
-
-        recur_add_row = Adw.ActionRow(title="Repeat")
-        self._entry_recur = Gtk.DropDown.new_from_strings(RECUR_OPTIONS)
-        self._entry_recur.set_valign(Gtk.Align.CENTER)
-        recur_add_row.add_suffix(self._entry_recur)
-        add_grp.add(recur_add_row)
-
-        add_task_btn = Gtk.Button(label="Add task")
-        add_task_btn.add_css_class("suggested-action"); add_task_btn.add_css_class("pill")
-        add_task_btn.set_margin_top(6)
-        add_task_btn.connect("clicked", lambda _: self._on_add(self._entry))
-        add_grp.set_header_suffix(add_task_btn)
-
-        self.append(add_grp)
-
-        # ── Calendar for due date in add-task group ───────────
-        self._add_cal = Gtk.Calendar()
-        self._add_cal.add_css_class("card")
-        self._add_cal.set_margin_top(4)
-        _add_cal_guard = [False]
-        _no_sc = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        _no_sc.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_sc.connect("scroll", lambda _c, _dx, _dy: True)
-        self._add_cal.add_controller(_no_sc)
-
-        def _add_cal_selected(cal):
-            if _add_cal_guard[0]: return
-            gdt = cal.get_date()
-            ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
-            _add_cal_guard[0] = True
-            self._entry_due.set_text(ds)
-            _add_cal_guard[0] = False
-
-        def _add_due_text_changed(*_):
-            if _add_cal_guard[0]: return
-            val = parse_natural_date(self._entry_due.get_text().strip())
-            if val:
-                try:
-                    dt = datetime.strptime(val, "%Y-%m-%d")
-                    _add_cal_guard[0] = True
-                    self._add_cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
-                    _add_cal_guard[0] = False
-                except Exception:
-                    pass
-
-        self._add_cal.connect("day-selected", _add_cal_selected)
-        self._entry_due.connect("notify::text", _add_due_text_changed)
-        self.append(self._add_cal)
+        # ── Add task button ───────────────────────────────────
+        hdr = Gtk.Box(spacing=8, margin_bottom=4)
+        add_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add task (Ctrl+N)")
+        add_btn.add_css_class("suggested-action")
+        add_btn.add_css_class("circular")
+        add_btn.set_halign(Gtk.Align.END)
+        add_btn.set_hexpand(True)
+        add_btn.connect("clicked", lambda _: self._new_task_dialog())
+        hdr.append(add_btn)
+        self.append(hdr)
 
         # ── Tag filter chips (rebuilt each time) ─────────────
         self._chips_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
@@ -2288,11 +2266,15 @@ class TodosView(Gtk.Box):
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
         sc.add_shortcut(Gtk.Shortcut.new(
             Gtk.KeyvalTrigger.new(Gdk.KEY_n, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: self._entry.grab_focus() or True),
+            Gtk.CallbackAction.new(lambda *_: self._new_task_dialog() or True),
         ))
         self.add_controller(sc)
 
         self._build_content()
+
+    def _new_task_dialog(self):
+        TodoEditDialog(self._win, {"text": "", "priority": "normal", "project_id": self._pid},
+                       on_save=self._build_content).present()
 
     # ── Build ──────────────────────────────────────────────────
 
@@ -2565,38 +2547,6 @@ class TodosView(Gtk.Box):
         return row
 
     # ── Actions ────────────────────────────────────────────────
-
-    def _on_add(self, entry):
-        raw = entry.get_text().strip()
-        if not raw:
-            return
-        text, inline_tags = parse_tags_from_text(raw)
-        # Merge inline tags with the dedicated tags row
-        extra_tags = normalize_tag_input(self._entry_tags.get_text())
-        tags = inline_tags
-        if extra_tags:
-            existing = set(tags.split()) if tags else set()
-            for t in extra_tags.split():
-                existing.add(t)
-            tags = " ".join(sorted(existing))
-        priority   = PRIORITIES[self._entry_pri.get_selected()]
-        recur_days = RECUR_DAYS[self._entry_recur.get_selected()]
-        due_date   = expand_date_shortcut(self._entry_due.get_text().strip()) or None
-        with get_db() as c:
-            new_pos = c.execute(
-                "SELECT COALESCE(MAX(order_pos)+1,0) FROM todo WHERE project_id=? AND done=0",
-                (self._pid,)).fetchone()[0]
-            c.execute(
-                "INSERT INTO todo (project_id,text,priority,tags,order_pos,recur_days,due_date)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (self._pid, text, priority, tags, new_pos, recur_days, due_date),
-            )
-        entry.set_text("")
-        self._entry_tags.set_text("")
-        self._entry_due.set_text("")
-        self._entry_recur.set_selected(0)
-        self._build_content()
-        GLib.timeout_add(80, lambda: (self._entry.grab_focus(), False)[1])
 
     def _reorder_todo(self, drag_id, drop_id):
         if drag_id == drop_id:
@@ -3227,9 +3177,10 @@ class AllPinnedNotesView(Gtk.Box):
 
 class NoteEditView(Gtk.Box):
     """Full-screen note editor pushed onto the navigation stack."""
-    def __init__(self, pid, win, note=None, on_save=None):
+    def __init__(self, pid, win, note=None, on_save=None, pop_fn=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._pid = pid; self._win = win; self._note = note; self._on_save = on_save
+        self._pop_fn = pop_fn
 
         toolbar = Gtk.Box(spacing=8,
                           margin_top=8, margin_bottom=8,
@@ -3239,6 +3190,9 @@ class NoteEditView(Gtk.Box):
         self._pin_btn = Gtk.ToggleButton(icon_name=pin_icon, active=bool(note and safe_col(note, "pinned")))
         self._pin_btn.add_css_class("flat")
         self._pin_btn.set_tooltip_text("Pin to dashboard")
+        self._pin_btn.connect("toggled", lambda btn: btn.set_icon_name(
+            "starred-symbolic" if btn.get_active() else "non-starred-symbolic"
+        ))
         toolbar.append(self._pin_btn)
 
         self._tags_entry = Gtk.Entry(placeholder_text="Labels (e.g. #idea #todo)",
@@ -3271,7 +3225,7 @@ class NoteEditView(Gtk.Box):
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
         sc.add_shortcut(Gtk.Shortcut.new(
             Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
-            Gtk.CallbackAction.new(lambda *_: self._save(None) or True),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), self._pop_fn() if self._pop_fn else None) or True),
         ))
         self.add_controller(sc)
 
@@ -3297,10 +3251,10 @@ class NoteEditView(Gtk.Box):
 
 
 class NotesView(Gtk.Box):
-    def __init__(self, pid, win, push_fn=None):
+    def __init__(self, pid, win, push_fn=None, pop_fn=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
-        self._pid = pid; self._win = win; self._push_fn = push_fn
+        self._pid = pid; self._win = win; self._push_fn = push_fn; self._pop_fn = pop_fn
         self._search_text = ""
 
         sc = Gtk.ShortcutController()
@@ -3325,14 +3279,14 @@ class NotesView(Gtk.Box):
 
     def _open_new(self):
         if self._push_fn:
-            view = NoteEditView(self._pid, self._win, on_save=self._refresh)
+            view = NoteEditView(self._pid, self._win, on_save=self._refresh, pop_fn=self._pop_fn)
             self._push_fn("New Note", view)
         else:
             NoteDialog(self._win, self._pid, on_save=self._refresh).present()
 
     def _open_edit(self, note):
         if self._push_fn:
-            view = NoteEditView(self._pid, self._win, note=note, on_save=self._refresh)
+            view = NoteEditView(self._pid, self._win, note=note, on_save=self._refresh, pop_fn=self._pop_fn)
             self._push_fn(note["content"][:30].replace("\n", " "), view)
         else:
             NoteDialog(self._win, self._pid, note=note, on_save=self._refresh).present()
@@ -4358,11 +4312,11 @@ class ProjectDetailView(Gtk.Box):
         self._push("Labels", TagsView(self._pid, self._win))
 
     def _open_notes(self):
-        view = NotesView(self._pid, self._win, push_fn=self._push)
+        view = NotesView(self._pid, self._win, push_fn=self._push, pop_fn=self._nav.pop)
         self._push("Notes", view,
                    add_cb=lambda: self._push(
                        "New Note",
-                       NoteEditView(self._pid, self._win, on_save=view._refresh)))
+                       NoteEditView(self._pid, self._win, on_save=view._refresh, pop_fn=self._nav.pop)))
 
     def _open_note_edit(self, note):
         self._push(
