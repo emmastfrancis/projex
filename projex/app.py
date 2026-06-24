@@ -12,7 +12,62 @@ from datetime import date, datetime, timedelta
 import colorsys
 
 APP_ID = "io.github.emmastf.Projex"
-VERSION = "0.1.30"
+VERSION = "0.1.31"
+
+# ── Inspirational quotes, keyed by busyness level ───────────────────────
+_QUOTES = {
+    "heavy": [
+        ("A river cuts through rock not by force, but by persistence.", "— proverb"),
+        ("You don't have to see the whole staircase. Just take the first step.", "— Martin Luther King Jr."),
+        ("It is not the mountain we conquer, but ourselves.", "— Edmund Hillary"),
+        ("The work itself will teach you.", "— Estonian proverb"),
+        ("Hard times arouse an instinctive desire for authenticity.", "— Coco Chanel"),
+        ("I am not afraid of storms, for I am learning how to sail my ship.", "— Louisa May Alcott"),
+        ("Doing a great right thing doesn't mean doing everything right.", "— adapted"),
+        ("Bear in mind that you should conduct yourself in life as at a feast.", "— Epictetus"),
+        ("Ichi-go ichi-e — this moment, once, never again.", "— Japanese concept"),
+        ("Even the tallest oak began as a small acorn that held its ground.", "— proverb"),
+    ],
+    "medium": [
+        ("Start where you are. Use what you have. Do what you can.", "— Arthur Ashe"),
+        ("Well done is better than well said.", "— Benjamin Franklin"),
+        ("Think of many things; do one.", "— Portuguese proverb"),
+        ("Small deeds done are better than great deeds planned.", "— Peter Marshall"),
+        ("Nothing great is created suddenly, any more than a bunch of grapes or a fig.", "— Epictetus"),
+        ("The secret of success is constancy to purpose.", "— Benjamin Disraeli"),
+        ("In the middle of every difficulty lies opportunity.", "— Albert Einstein"),
+        ("What is not started today is never finished tomorrow.", "— Goethe"),
+        ("Steady drops will bore through stone.", "— proverb"),
+        ("To climb steep hills requires slow pace at first.", "— Shakespeare"),
+    ],
+    "light": [
+        ("Almost everything will work again if you unplug it for a few minutes. Including you.", "— Anne Lamott"),
+        ("The quieter you become, the more you can hear.", "— Ram Dass"),
+        ("Creativity is a gift. It doesn't come through if the air is cluttered.", "— John Lennon"),
+        ("A calm and modest life brings more happiness than the pursuit of success combined with restlessness.", "— Albert Einstein"),
+        ("Rest is not idleness, and to lie sometimes on the grass on a summer day is by no means a waste of time.", "— John Lubbock"),
+        ("It is a happy talent to know how to play.", "— Ralph Waldo Emerson"),
+        ("Do a little more each day than you think you possibly can.", "— Lowell Thomas"),
+        ("Let your plans be dark and impenetrable as night, and when you move, fall like a thunderbolt.", "— Sun Tzu"),
+        ("The present moment always will have been.", "— proverb"),
+        ("Not all those who wander are lost.", "— J. R. R. Tolkien"),
+    ],
+    "clear": [
+        ("Rest and be thankful.", "— William Wordsworth"),
+        ("It is good to have an end to journey toward; but it is the journey that matters, in the end.", "— Ursula K. Le Guin"),
+        ("What you do today can improve all your tomorrows.", "— Ralph Marston"),
+        ("The richness of life lies in memories we have forgotten.", "— Cesare Pavese"),
+        ("Now is no time to think of what you do not have. Think of what you can do with what there is.", "— Ernest Hemingway"),
+        ("In seed time learn, in harvest teach, in winter enjoy.", "— William Blake"),
+        ("A good plan violently executed now is better than a perfect plan executed next week.", "— George Patton"),
+        ("Beginnings are always messy.", "— John Galsworthy"),
+    ],
+}
+_SESSION_QUOTE_IDX = random.randint(0, 9999)
+
+def _pick_quote(level):
+    pool = _QUOTES.get(level, _QUOTES["light"])
+    return pool[_SESSION_QUOTE_IDX % len(pool)]
 _CHANGELOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHANGELOG.md")
 _data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 _data_dir = os.path.join(_data_home, "projex")
@@ -4003,6 +4058,22 @@ class HomeView(Gtk.Box):
         files_row.connect("activated", lambda _: self._win.show_all_files())
         headline.add(files_row)
         self.append(headline)
+
+        # ── Inspirational quote (keyed to busyness) ───
+        q_level = ("heavy" if month_due >= 15 else
+                   "medium" if month_due >= 8 else
+                   "light" if month_due >= 1 else "clear")
+        q_text, q_attr = _pick_quote(q_level)
+        q_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                        margin_top=4, margin_bottom=4)
+        q_lbl = Gtk.Label(wrap=True, xalign=0)
+        q_lbl.set_markup(f"<i>{GLib.markup_escape_text(q_text)}</i>")
+        q_lbl.add_css_class("dim-label")
+        q_box.append(q_lbl)
+        a_lbl = Gtk.Label(label=q_attr, xalign=1)
+        a_lbl.add_css_class("caption"); a_lbl.add_css_class("dim-label")
+        q_box.append(a_lbl)
+        self.append(q_box)
 
         # ── Per-project rows ──────────────────────────
         def _make_proj_row(p):
