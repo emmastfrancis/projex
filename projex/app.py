@@ -342,12 +342,26 @@ def mpris_get_state(player_name):
 def mpris_action(player_name, action):
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        proxy = Gio.DBusProxy.new_sync(       # 7 args — no trailing None
+        proxy = Gio.DBusProxy.new_sync(
             bus, Gio.DBusProxyFlags.NONE, None,
             player_name, "/org/mpris/MediaPlayer2",
             "org.mpris.MediaPlayer2.Player", None,
         )
         proxy.call_sync(action, None, Gio.DBusCallFlags.NONE, -1, None)
+    except Exception:
+        pass
+
+
+def mpris_raise(player_name):
+    """Bring the media player window to the foreground via MPRIS Raise."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        proxy = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, None,
+            player_name, "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2", None,
+        )
+        proxy.call_sync("Raise", None, Gio.DBusCallFlags.NONE, -1, None)
     except Exception:
         pass
 
@@ -4964,11 +4978,17 @@ class NowPlayingBar(Gtk.Box):
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
                        margin_start=4, hexpand=True)
         info.set_valign(Gtk.Align.CENTER)
+        info.set_tooltip_text("Click to open player")
+        info.set_cursor(Gdk.Cursor.new_from_name("pointer"))
         self._title_lbl = Gtk.Label(xalign=0)
         self._title_lbl.add_css_class("caption")
         self._artist_lbl = Gtk.Label(xalign=0)
         self._artist_lbl.add_css_class("caption"); self._artist_lbl.add_css_class("dim-label")
         info.append(self._title_lbl); info.append(self._artist_lbl)
+        gc = Gtk.GestureClick.new()
+        gc.set_button(1)
+        gc.connect("pressed", lambda _g, _n, _x, _y: mpris_raise(self._player) if self._player else None)
+        info.add_controller(gc)
 
         inner.append(ctrl); inner.append(info)
         self._rev.set_child(inner)
