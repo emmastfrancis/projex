@@ -895,20 +895,20 @@ def section_page(title, content_widget, extra_header_widgets=None):
 
 # Jewel-tone palette that pops on the dark Gantt background
 GANTT_PALETTE = [
-    (0.31, 0.76, 0.97, 0.88),  # sky blue
-    (0.40, 0.82, 0.67, 0.88),  # emerald
-    (0.98, 0.61, 0.35, 0.88),  # coral-orange
-    (0.71, 0.50, 0.92, 0.88),  # soft violet
-    (0.35, 0.81, 0.77, 0.88),  # teal
-    (0.97, 0.79, 0.28, 0.88),  # golden amber
-    (0.94, 0.43, 0.63, 0.88),  # rose
-    (0.60, 0.85, 0.40, 0.88),  # lime green
+    (0.31, 0.76, 0.97, 0.88),  # sky blue        (cool)
+    (0.98, 0.61, 0.35, 0.88),  # coral-orange    (warm)
+    (0.40, 0.82, 0.67, 0.88),  # emerald         (cool)
+    (0.94, 0.43, 0.63, 0.88),  # rose-pink       (warm)
+    (0.35, 0.81, 0.77, 0.88),  # teal            (cool)
+    (0.97, 0.79, 0.28, 0.88),  # golden amber    (warm)
+    (0.60, 0.85, 0.40, 0.88),  # lime green      (cool)
+    (0.71, 0.50, 0.92, 0.88),  # soft violet     (cool-ish, last so never adjacent to teal)
 ]
 
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None, use_palette=True):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None, use_palette=True, on_bar_activated=None):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -921,6 +921,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._label_w_base = label_w_base
         self._on_label_resize = on_label_resize
         self._use_palette = use_palette
+        self._on_bar_activated = on_bar_activated
         self._drag_active = False
         self._drag_start_lw = label_w_base
         row_h = int(36 * self._zoom)
@@ -938,6 +939,23 @@ class _GanttDrawArea(Gtk.DrawingArea):
         motion = Gtk.EventControllerMotion.new()
         motion.connect("motion", self._on_divider_motion)
         self.add_controller(motion)
+
+        gc = Gtk.GestureClick.new()
+        gc.set_button(1)
+        gc.connect("pressed", self._on_bar_click)
+        self.add_controller(gc)
+
+    def _on_bar_click(self, gesture, n_press, x, y):
+        if n_press != 2 or not self._on_bar_activated:
+            return
+        z = self._zoom
+        HDR_H = int(28 * z)
+        ROW_H = int(36 * z)
+        if y < HDR_H:
+            return
+        idx = int((y - HDR_H) / ROW_H)
+        if 0 <= idx < len(self._items):
+            self._on_bar_activated(self._items[idx])
 
     def _bar_color(self, item, idx=0):
         status = compute_goal_status(item)
@@ -1285,7 +1303,7 @@ class GanttChart(Gtk.Box):
             project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb, use_palette=self._use_palette)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb, use_palette=self._use_palette, on_bar_activated=self._on_bar_activated_cb)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
@@ -1318,6 +1336,11 @@ class GanttChart(Gtk.Box):
             return e >= vstart and s <= vend
         except (ValueError, KeyError):
             return False
+
+    def _on_bar_activated_cb(self, item):
+        pid = item.get("project_id") or self._pid
+        if pid and self._win:
+            self._win._open_project(int(pid), section="goals")
 
 
 # ══════════════════════════════════════════════════════
@@ -2912,6 +2935,7 @@ class GoalsView(Gtk.Box):
     def _refresh(self):
         try:
             self._do_refresh()
+            self._gantt._rebuild()
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -3694,7 +3718,7 @@ class ComingUpView(Gtk.Box):
             sp = Adw.StatusPage(
                 title="Nothing due in the next 90 days",
                 description="Add goal end dates or task due dates to see them here",
-                icon_name="alarm-symbolic",
+                icon_name="flag-symbolic",
             )
             sp.set_vexpand(True)
             self.append(sp)
@@ -3728,7 +3752,8 @@ class ComingUpView(Gtk.Box):
             dot = color_dot(it.get("project_color") or "#4fa8c4", size=10)
             dot.set_valign(Gtk.Align.CENTER)
             row.add_prefix(dot)
-            row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
+            row.connect("activated", lambda _, pid=it["project_id"], kind=it["kind"]:
+                self._win._open_project(pid, section="goals" if kind == "Goal" else "tasks"))
 
             ul = Gtk.Label(label=urgency_tx)
             ul.add_css_class("caption")
@@ -3927,7 +3952,8 @@ class HomeView(Gtk.Box):
                 dot.set_valign(Gtk.Align.CENTER)
                 row.add_prefix(dot)
                 row.set_activatable(True)
-                row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
+                row.connect("activated", lambda _, pid=it["project_id"], kind=it["kind"]:
+                    self._win._open_project(pid, section="goals" if kind == "Goal" else "tasks"))
                 ul = Gtk.Label(label=urgency_tx)
                 ul.add_css_class("caption"); ul.add_css_class(urgency_cl)
                 ul.set_valign(Gtk.Align.CENTER)
@@ -3960,7 +3986,8 @@ class HomeView(Gtk.Box):
                 dot.set_valign(Gtk.Align.CENTER)
                 row.add_prefix(dot)
                 row.set_activatable(True)
-                row.connect("activated", lambda _, pid=it["project_id"]: self._win._open_project(pid))
+                row.connect("activated", lambda _, pid=it["project_id"], kind=it["kind"]:
+                    self._win._open_project(pid, section="goals" if kind == "Goal" else "tasks"))
                 dl_lbl = Gtk.Label(label=f"{dl}d")
                 dl_lbl.add_css_class("caption"); dl_lbl.add_css_class("dim-label")
                 dl_lbl.set_valign(Gtk.Align.CENTER)
@@ -4226,7 +4253,7 @@ class ProjectDetailView(Gtk.Box):
         hdr.pack_end(export_btn)
 
         # Shift dates button
-        shift_btn = Gtk.Button(icon_name="calendar-symbolic")
+        shift_btn = Gtk.Button(icon_name="media-skip-forward-symbolic")
         shift_btn.add_css_class("flat"); shift_btn.set_tooltip_text("Push all dates forward")
         shift_btn.connect("clicked", lambda _: ShiftDatesDialog(
             self._win, self._pid, on_save=self._rebuild_tiles
@@ -4767,6 +4794,42 @@ class FocusModeView(Gtk.Box):
         GLib.idle_add(self._build)
 
 
+TUTORIAL_TEXT = """\
+PROJEX — KEYBOARD SHORTCUTS & HELP
+═══════════════════════════════════════════════════════
+
+NAVIGATION
+  Ctrl+N    New item (task/goal/note in current view)
+  Ctrl+S    Save and close current dialog / note editor
+  Esc / ←   Go back (inside project navigation)
+
+TASKS
+  Ctrl+N    Open "New task" dialog
+  Drag ⠿    Drag the handle to reorder active tasks
+  Double-click row    Edit task
+  Bulk mode    Click "Select" in header to multi-select
+
+GOALS
+  Ctrl+N    New goal dialog
+  Double-click row    Open goal detail / summary
+  Double-click Gantt bar    Jump to that goal
+
+GANTT CHART
+  Drag divider    Resize label column (reveal full names)
+  Zoom slider    Scale the timeline horizontally
+  Colors dropdown    Switch between jewel-tone palette and system theme
+  Double-click bar    Navigate to that goal
+
+NOTES
+  Ctrl+S    Save note and return to notes list
+  Click star    Pin/unpin note
+
+GENERAL
+  Pomodoro ⏱    Start/stop 25-min focus timer in sidebar
+  Push dates ⏭    Shift all task/goal dates forward in project header
+  Right-click project    Move project to a group
+"""
+
 class HelpDialog(Adw.Window):
     def __init__(self, parent):
         super().__init__(title="Help & Shortcuts", modal=True, transient_for=parent,
@@ -4818,7 +4881,7 @@ class MainWindow(Adw.ApplicationWindow):
         home_btn.set_tooltip_text("Overview")
         home_btn.connect("clicked", lambda _: self.show_home())
         shdr.pack_start(home_btn)
-        coming_btn = Gtk.Button(icon_name="alarm-symbolic")
+        coming_btn = Gtk.Button(icon_name="flag-symbolic")
         coming_btn.add_css_class("flat")
         coming_btn.set_tooltip_text("Upcoming Deadlines")
         coming_btn.connect("clicked", lambda _: self.show_coming_up())
