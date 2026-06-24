@@ -1100,7 +1100,12 @@ class _GanttDrawArea(Gtk.DrawingArea):
         bar_pos = {}
         for i, item in enumerate(items):
             y = HDR_H + i * ROW_H
-            if i % 2 == 0:
+            is_overdue = (compute_goal_status(item) == "overdue")
+
+            if is_overdue:
+                cr.set_source_rgba(0.88, 0.11, 0.14, 0.09)
+                cr.rectangle(0, y, width, ROW_H); cr.fill()
+            elif i % 2 == 0:
                 cr.set_source_rgba(1, 1, 1, 0.025)
                 cr.rectangle(0, y, width, ROW_H); cr.fill()
 
@@ -1114,7 +1119,10 @@ class _GanttDrawArea(Gtk.DrawingArea):
 
             label_text = item.get("text") or item.get("title") or ""
             cr.set_font_size(14 * z)
-            cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
+            if is_overdue:
+                cr.set_source_rgba(0.88, 0.11, 0.14, 1.0)
+            else:
+                cr.set_source_rgba(0.78, 0.80, 0.87, 1.0)
             cr.save()
             cr.rectangle(strip_w, y, LABEL_W - strip_w - 6, ROW_H)
             cr.clip()
@@ -2232,7 +2240,7 @@ class ChangelogDialog(Adw.Window):
         scroll = Gtk.ScrolledWindow(vexpand=True,
                                     margin_top=12, margin_bottom=12,
                                     margin_start=18, margin_end=18)
-        label = Gtk.Label(label=text, xalign=0, yalign=0, wrap=True, selectable=True)
+        label = Gtk.Label(label=text, xalign=0, yalign=0, wrap=True, selectable=False)
         label.add_css_class("monospace")
         scroll.set_child(label)
         tv.set_content(scroll)
@@ -2906,18 +2914,24 @@ class GoalsView(Gtk.Box):
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
         self._pid = pid; self._win = win; self._push_fn = push_fn
 
-        # Gantt chart at the top (always visible when goals exist)
-        project = db_project(self._pid)
-        gantt_lbl = Gtk.Label(label="Timeline", xalign=0)
-        gantt_lbl.add_css_class("heading")
-        self.append(gantt_lbl)
-        self._gantt = GanttChart(self._pid, project, self._win)
-        self.append(self._gantt)
-
         tb = tip_banner("goals_v2",
             "Goals act as milestones on the Gantt chart — set a start and end date to see them plotted. "
             "Assign tasks to a goal to group them. Use +7d / +2w in date fields as shortcuts.")
         if tb: self.append(tb)
+
+        # Gantt chart below the tip
+        project = db_project(self._pid)
+        gantt_lbl = Gtk.Label(label="Timeline", xalign=0)
+        gantt_lbl.add_css_class("heading")
+        self.append(gantt_lbl)
+        hint = Gtk.Label()
+        hint.set_markup("<i><span size='small'>Overdue items shown in red</span></i>")
+        hint.set_halign(Gtk.Align.START)
+        hint.add_css_class("dim-label")
+        hint.set_margin_bottom(2)
+        self.append(hint)
+        self._gantt = GanttChart(self._pid, project, self._win)
+        self.append(self._gantt)
 
         sc = Gtk.ShortcutController()
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
@@ -3062,12 +3076,6 @@ class GoalsView(Gtk.Box):
         for g in active_goals:
             grp.add(_make_goal_row(g))
 
-        hint = Gtk.Label()
-        hint.set_markup("<i><span size='small'>Overdue items shown in red</span></i>")
-        hint.set_halign(Gtk.Align.START)
-        hint.add_css_class("dim-label")
-        hint.set_margin_bottom(2)
-        self._content.append(hint)
         self._content.append(grp)
 
         # ── Completed goals (collapsible) ─────────────────────
@@ -4840,7 +4848,7 @@ class HelpDialog(Adw.Window):
                                     margin_top=12, margin_bottom=12,
                                     margin_start=18, margin_end=18)
         label = Gtk.Label(label=TUTORIAL_TEXT, xalign=0, yalign=0,
-                          wrap=False, selectable=True)
+                          wrap=False, selectable=False)
         label.add_css_class("monospace")
         scroll.set_child(label)
         tv.set_content(scroll)
