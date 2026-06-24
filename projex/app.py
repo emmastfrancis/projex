@@ -314,10 +314,10 @@ def mpris_get_players():
 def mpris_get_state(player_name):
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        proxy = Gio.DBusProxy.new_sync(
+        proxy = Gio.DBusProxy.new_sync(       # 7 args — no trailing None
             bus, Gio.DBusProxyFlags.NONE, None,
             player_name, "/org/mpris/MediaPlayer2",
-            "org.freedesktop.DBus.Properties", None, None,
+            "org.freedesktop.DBus.Properties", None,
         )
         pb_v = proxy.call_sync("Get",
             GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", "PlaybackStatus")),
@@ -325,18 +325,16 @@ def mpris_get_state(player_name):
         md_v = proxy.call_sync("Get",
             GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", "Metadata")),
             Gio.DBusCallFlags.NONE, -1, None)
-        pb_status = str(pb_v[0])
-        md = md_v[0]
-        title = str(md["xesam:title"]) if "xesam:title" in md else ""
-        artists_raw = md["xesam:artist"] if "xesam:artist" in md else []
+        pb_status = str(pb_v[0])              # GI returns Python str directly
+        md = md_v[0]                           # GI returns Python dict directly
+        title = str(md.get("xesam:title", "") or "")
+        album = str(md.get("xesam:album", "") or "")
+        artists_raw = md.get("xesam:artist", []) or []
         if isinstance(artists_raw, str):
             artist = artists_raw
         else:
-            try:
-                artist = ", ".join(str(a) for a in artists_raw)
-            except Exception:
-                artist = ""
-        return {"title": title, "artist": artist, "status": pb_status}
+            artist = ", ".join(str(a) for a in artists_raw)
+        return {"title": title, "artist": artist, "album": album, "status": pb_status}
     except Exception:
         return None
 
@@ -344,10 +342,10 @@ def mpris_get_state(player_name):
 def mpris_action(player_name, action):
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        proxy = Gio.DBusProxy.new_sync(
+        proxy = Gio.DBusProxy.new_sync(       # 7 args — no trailing None
             bus, Gio.DBusProxyFlags.NONE, None,
             player_name, "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player", None, None,
+            "org.mpris.MediaPlayer2.Player", None,
         )
         proxy.call_sync(action, None, Gio.DBusCallFlags.NONE, -1, None)
     except Exception:
@@ -530,6 +528,7 @@ def migrate_db():
             "ALTER TABLE todo ADD COLUMN goal_id         INTEGER DEFAULT NULL",
             "ALTER TABLE todo ADD COLUMN recur_end_date  TEXT    DEFAULT ''",
             "ALTER TABLE goal ADD COLUMN linked_note_id  INTEGER DEFAULT NULL",
+            "ALTER TABLE playlist_item ADD COLUMN album TEXT DEFAULT ''",
         ]:
             try:
                 c.execute(sql)
@@ -677,6 +676,19 @@ def db_playlist_items(pid):
         return c.execute(
             "SELECT * FROM playlist_item WHERE project_id=? ORDER BY position, id", (pid,)
         ).fetchall()
+
+
+def db_playlist_name(pid, project_name):
+    key = f"playlist_name_{pid}"
+    with get_db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else f"Focus playlist — {project_name}"
+
+
+def db_playlist_set_name(pid, name):
+    key = f"playlist_name_{pid}"
+    with get_db() as c:
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, name))
 
 
 def db_coming_up(days=90):
@@ -4552,7 +4564,8 @@ class ProjectDetailView(Gtk.Box):
         self._push("Files", view, add_cb=lambda: view._pick_file(None))
 
     def _open_playlist(self):
-        view = PlaylistView(self._pid, self._win)
+        proj_name = self._project["name"] if self._project else ""
+        view = PlaylistView(self._pid, self._win, project_name=proj_name)
         self._push("Focus Playlist", view)
 
     def _open_section(self, section):
@@ -5017,15 +5030,20 @@ class PlaylistItemDialog(Adw.Dialog):
                       margin_top=12, margin_bottom=20, margin_start=12, margin_end=12)
 
         grp = Adw.PreferencesGroup()
-        self._title_row = Adw.EntryRow(title="Song / album / playlist title *")
+        self._title_row = Adw.EntryRow(title="Song title")
         if item:
             self._title_row.set_text(item["title"] or "")
         grp.add(self._title_row)
 
-        self._artist_row = Adw.EntryRow(title="Artist  (optional)")
+        self._artist_row = Adw.EntryRow(title="Artist")
         if item:
             self._artist_row.set_text(safe_col(item, "artist") or "")
         grp.add(self._artist_row)
+
+        self._album_row = Adw.EntryRow(title="Album  (optional)")
+        if item:
+            self._album_row.set_text(safe_col(item, "album") or "")
+        grp.add(self._album_row)
 
         self._url_row = Adw.EntryRow(title="Link  (optional — Spotify URI, URL…)")
         if item:
@@ -5047,23 +5065,35 @@ class PlaylistItemDialog(Adw.Dialog):
         tv.set_content(box)
         self.set_child(tv)
 
+        # Ctrl+S saves
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.MANAGED)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.KeyvalTrigger.new(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK),
+            Gtk.CallbackAction.new(lambda *_: (self._save(None), True)[1]),
+        ))
+        self.add_controller(sc)
+
     def _save(self, _):
         title = self._title_row.get_text().strip()
         if not title:
             return
         artist = self._artist_row.get_text().strip()
+        album  = self._album_row.get_text().strip()
         url    = self._url_row.get_text().strip()
         with get_db() as c:
             if self._item:
-                c.execute("UPDATE playlist_item SET title=?, artist=?, url=? WHERE id=?",
-                          (title, artist, url, self._item["id"]))
+                c.execute(
+                    "UPDATE playlist_item SET title=?, artist=?, album=?, url=? WHERE id=?",
+                    (title, artist, album, url, self._item["id"]))
             else:
                 pos = c.execute(
                     "SELECT COALESCE(MAX(position),0) FROM playlist_item WHERE project_id=?",
                     (self._pid,)).fetchone()[0]
                 c.execute(
-                    "INSERT INTO playlist_item (project_id, title, artist, url, position) VALUES (?,?,?,?,?)",
-                    (self._pid, title, artist, url, pos + 1))
+                    "INSERT INTO playlist_item (project_id, title, artist, album, url, position)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (self._pid, title, artist, album, url, pos + 1))
         self.close()
         if self._on_save:
             self._on_save()
@@ -5081,20 +5111,33 @@ class PlaylistItemDialog(Adw.Dialog):
 
 class PlaylistView(Gtk.Box):
     """Per-project focus playlist."""
-    def __init__(self, pid, win):
+    def __init__(self, pid, win, project_name=""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                          margin_top=12, margin_bottom=12, margin_start=18, margin_end=18)
-        self._pid = pid; self._win = win
+        self._pid = pid; self._win = win; self._project_name = project_name
         self._build()
 
     def _build(self):
         clear_box(self)
         items = db_playlist_items(self._pid)
+        pl_name = db_playlist_name(self._pid, self._project_name)
+
+        # ── Editable playlist name header ─────────────────────
+        name_box = Gtk.Box(spacing=6)
+        name_lbl = Gtk.Label(label=pl_name, xalign=0, hexpand=True)
+        name_lbl.add_css_class("title-3")
+        name_box.append(name_lbl)
+        edit_name_btn = Gtk.Button(icon_name="document-edit-symbolic")
+        edit_name_btn.add_css_class("flat"); edit_name_btn.set_valign(Gtk.Align.CENTER)
+        edit_name_btn.set_tooltip_text("Rename playlist")
+        edit_name_btn.connect("clicked", lambda _: self._rename_dialog(pl_name))
+        name_box.append(edit_name_btn)
+        self.append(name_box)
 
         tip = Gtk.Label(wrap=True, xalign=0)
         tip.set_markup(
-            "<i><span size='small'>Songs, albums, or playlists to listen to while you work. "
-            "Add a link and tap the row to open it in your music player.</span></i>")
+            "<i><span size='small'>Music to listen to while you work on this project. "
+            "Add a link and tap the open button to launch your music player.</span></i>")
         tip.add_css_class("dim-label")
         self.append(tip)
 
@@ -5109,18 +5152,21 @@ class PlaylistView(Gtk.Box):
         else:
             grp = Adw.PreferencesGroup()
             for it in items:
+                artist = safe_col(it, "artist") or ""
+                album  = safe_col(it, "album") or ""
+                subtitle_parts = [p for p in [artist, album] if p]
                 row = Adw.ActionRow(title=it["title"])
-                if safe_col(it, "artist"):
-                    row.set_subtitle(it["artist"])
+                if subtitle_parts:
+                    row.set_subtitle("  ·  ".join(subtitle_parts))
                 url = safe_col(it, "url") or ""
                 if url:
-                    row.set_activatable(True)
-                    row.connect("activated", lambda _, u=url: Gio.AppInfo.launch_default_for_uri(u, None))
                     open_btn = Gtk.Button(icon_name="link-symbolic")
                     open_btn.add_css_class("flat"); open_btn.set_valign(Gtk.Align.CENTER)
                     open_btn.set_tooltip_text("Open link")
                     open_btn.connect("clicked", lambda _, u=url: Gio.AppInfo.launch_default_for_uri(u, None))
                     row.add_suffix(open_btn)
+                    row.set_activatable(True)
+                    row.connect("activated", lambda _, u=url: Gio.AppInfo.launch_default_for_uri(u, None))
                 edit_btn = Gtk.Button(icon_name="document-edit-symbolic")
                 edit_btn.add_css_class("flat"); edit_btn.set_valign(Gtk.Align.CENTER)
                 edit_btn.set_tooltip_text("Edit")
@@ -5136,6 +5182,27 @@ class PlaylistView(Gtk.Box):
         add_btn.connect("clicked", lambda _:
             PlaylistItemDialog(self._win, self._pid, on_save=self._build).present())
         self.append(add_btn)
+
+    def _rename_dialog(self, current_name):
+        dlg = Adw.Dialog(title="Rename playlist", content_width=380)
+        tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=20, margin_start=12, margin_end=12)
+        grp = Adw.PreferencesGroup()
+        entry = Adw.EntryRow(title="Playlist name")
+        entry.set_text(current_name)
+        grp.add(entry); box.append(grp)
+        save_btn = Gtk.Button(label="Rename")
+        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
+        def do_rename(_):
+            name = entry.get_text().strip()
+            if name:
+                db_playlist_set_name(self._pid, name)
+            dlg.close()
+            self._build()
+        save_btn.connect("clicked", do_rename)
+        box.append(save_btn); tv.set_content(box); dlg.set_child(tv)
+        dlg.present(self._win)
 
 
 class HelpDialog(Adw.Window):
