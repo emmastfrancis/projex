@@ -9,6 +9,7 @@ import math
 import re
 import random
 from datetime import date, datetime, timedelta
+import colorsys
 
 APP_ID = "io.github.emmastf.Projex"
 VERSION = "0.1.30"
@@ -907,7 +908,7 @@ GANTT_PALETTE = [
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None, use_palette=True):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -919,6 +920,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._zoom = max(0.5, min(4.0, zoom))
         self._label_w_base = label_w_base
         self._on_label_resize = on_label_resize
+        self._use_palette = use_palette
         self._drag_active = False
         self._drag_start_lw = label_w_base
         row_h = int(36 * self._zoom)
@@ -941,9 +943,29 @@ class _GanttDrawArea(Gtk.DrawingArea):
         status = compute_goal_status(item)
         if status == "overdue":
             return (0.88, 0.11, 0.14, 0.92)
-        r, g, b, a = GANTT_PALETTE[idx % len(GANTT_PALETTE)]
+
+        if self._use_palette:
+            r, g, b, a = GANTT_PALETTE[idx % len(GANTT_PALETTE)]
+        else:
+            # System-theme mode: generate tonal variants from the system/project accent
+            ar, ag, ab = self._accent.red, self._accent.green, self._accent.blue
+            h, s, v = colorsys.rgb_to_hsv(ar, ag, ab)
+            # 8 variants: cycle hue slightly ±, vary saturation and brightness
+            VARIANTS = [
+                (h,                  s,            min(1.0, v * 1.00)),
+                ((h + 0.08) % 1.0,  s * 0.85,     min(1.0, v * 1.15)),
+                ((h - 0.08) % 1.0,  min(1.0, s * 1.10), min(1.0, v * 0.90)),
+                (h,                  s * 0.65,     min(1.0, v * 1.25)),
+                ((h + 0.15) % 1.0,  s * 0.90,     min(1.0, v * 1.05)),
+                ((h - 0.15) % 1.0,  s * 0.80,     min(1.0, v * 1.10)),
+                (h,                  min(1.0, s * 1.15), min(1.0, v * 0.85)),
+                ((h + 0.05) % 1.0,  s * 0.75,     min(1.0, v * 1.20)),
+            ]
+            hv, sv, vv = VARIANTS[idx % len(VARIANTS)]
+            r, g, b = colorsys.hsv_to_rgb(hv, sv, vv)
+            a = 0.88
+
         if status == "done":
-            # Desaturate done bars so they read as finished
             avg = (r + g + b) / 3
             f = 0.45
             return (r * f + avg * (1 - f), g * f + avg * (1 - f), b * f + avg * (1 - f), 0.60)
@@ -1173,6 +1195,14 @@ class GanttChart(Gtk.Box):
         zoom_lbl.add_css_class("caption")
 
         self._label_w = 170
+        self._use_palette = True
+
+        color_lbl = Gtk.Label(label="Colors:", valign=Gtk.Align.CENTER)
+        color_lbl.add_css_class("caption")
+        self._color_drop = Gtk.DropDown.new_from_strings(["Palette", "System theme"])
+        self._color_drop.set_valign(Gtk.Align.CENTER)
+        self._color_drop.set_tooltip_text("Bar colour scheme")
+        self._color_drop.connect("notify::selected", self._on_color_mode)
 
         hdr = Gtk.Box(spacing=10, margin_bottom=2)
         hdr.append(Gtk.Label(label="View:"))
@@ -1180,6 +1210,11 @@ class GanttChart(Gtk.Box):
         sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
         sep1.set_margin_start(4); sep1.set_margin_end(4)
         hdr.append(sep1)
+        hdr.append(color_lbl)
+        hdr.append(self._color_drop)
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_margin_start(4); sep2.set_margin_end(4)
+        hdr.append(sep2)
         hdr.append(zoom_lbl)
         hdr.append(self._zoom_scale)
         self.append(hdr)
@@ -1203,6 +1238,10 @@ class GanttChart(Gtk.Box):
 
     def _on_zoom(self, scale):
         self._zoom = scale.get_value()
+        GLib.idle_add(self._rebuild)
+
+    def _on_color_mode(self, drop, _):
+        self._use_palette = (drop.get_selected() == 0)
         GLib.idle_add(self._rebuild)
 
     def _on_label_resize_cb(self, new_lw):
@@ -1246,7 +1285,7 @@ class GanttChart(Gtk.Box):
             project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb, use_palette=self._use_palette)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
