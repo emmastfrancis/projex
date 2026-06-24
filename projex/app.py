@@ -692,6 +692,21 @@ def db_playlist_items(pid):
         ).fetchall()
 
 
+def db_monthly_summary():
+    """Return (due_count, high_priority_count, overdue_count) for the next 30 days."""
+    today  = date.today().isoformat()
+    cutoff = (date.today() + timedelta(days=30)).isoformat()
+    with get_db() as c:
+        due = c.execute(
+            "SELECT priority FROM todo WHERE done=0 AND due_date!='' AND due_date>=? AND due_date<=?",
+            (today, cutoff)).fetchall()
+        overdue_count = c.execute(
+            "SELECT COUNT(*) FROM todo WHERE done=0 AND due_date!='' AND due_date<?",
+            (today,)).fetchone()[0]
+    high = sum(1 for t in due if safe_col(t, "priority") == "high")
+    return len(due), high, overdue_count
+
+
 def db_playlist_name(pid, project_name):
     key = f"playlist_name_{pid}"
     with get_db() as c:
@@ -1007,7 +1022,7 @@ GANTT_PALETTE = [
 class _GanttDrawArea(Gtk.DrawingArea):
     """Internal drawing widget for the Gantt chart."""
 
-    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None, use_palette=True, on_bar_activated=None):
+    def __init__(self, items, accent, view_start=None, view_end=None, show_project_label=False, tasks=None, show_tasks=True, zoom=1.0, label_w_base=170, on_label_resize=None, use_palette=True, color_mode="palette", on_bar_activated=None):
         super().__init__()
         self._items = items
         self._accent = accent
@@ -1020,6 +1035,7 @@ class _GanttDrawArea(Gtk.DrawingArea):
         self._label_w_base = label_w_base
         self._on_label_resize = on_label_resize
         self._use_palette = use_palette
+        self._color_mode = color_mode
         self._on_bar_activated = on_bar_activated
         self._drag_active = False
         self._drag_start_lw = label_w_base
@@ -1061,13 +1077,21 @@ class _GanttDrawArea(Gtk.DrawingArea):
         if status == "overdue":
             return (0.88, 0.11, 0.14, 0.92)
 
-        if self._use_palette:
+        mode = self._color_mode
+        if mode == "palette":
             r, g, b, a = GANTT_PALETTE[idx % len(GANTT_PALETTE)]
+        elif mode == "project":
+            # Use each item's own project colour exactly; fall back to accent
+            pc_hex = item.get("_project_color") or ""
+            if pc_hex:
+                pc = parse_rgba(pc_hex)
+                r, g, b, a = pc.red, pc.green, pc.blue, 0.88
+            else:
+                r, g, b, a = self._accent.red, self._accent.green, self._accent.blue, 0.88
         else:
-            # System-theme mode: generate tonal variants from the system/project accent
+            # System-theme mode: generate tonal variants from the project accent
             ar, ag, ab = self._accent.red, self._accent.green, self._accent.blue
             h, s, v = colorsys.rgb_to_hsv(ar, ag, ab)
-            # 8 variants: cycle hue slightly ±, vary saturation and brightness
             VARIANTS = [
                 (h,                  s,            min(1.0, v * 1.00)),
                 ((h + 0.08) % 1.0,  s * 0.85,     min(1.0, v * 1.15)),
@@ -1320,11 +1344,11 @@ class GanttChart(Gtk.Box):
         zoom_lbl.add_css_class("caption")
 
         self._label_w = 170
-        self._use_palette = True
+        self._color_mode = "palette"
 
         color_lbl = Gtk.Label(label="Colors:", valign=Gtk.Align.CENTER)
         color_lbl.add_css_class("caption")
-        self._color_drop = Gtk.DropDown.new_from_strings(["Palette", "System theme"])
+        self._color_drop = Gtk.DropDown.new_from_strings(["Palette", "System theme", "Project colour"])
         self._color_drop.set_valign(Gtk.Align.CENTER)
         self._color_drop.set_tooltip_text("Bar colour scheme")
         self._color_drop.connect("notify::selected", self._on_color_mode)
@@ -1366,7 +1390,7 @@ class GanttChart(Gtk.Box):
         GLib.idle_add(self._rebuild)
 
     def _on_color_mode(self, drop, _):
-        self._use_palette = (drop.get_selected() == 0)
+        self._color_mode = ["palette", "system", "project"][drop.get_selected()]
         GLib.idle_add(self._rebuild)
 
     def _on_label_resize_cb(self, new_lw):
@@ -1410,7 +1434,7 @@ class GanttChart(Gtk.Box):
             project_color = safe_col(self._project, "color") or "#4fa8c4"
         accent = parse_rgba(project_color)
 
-        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb, use_palette=self._use_palette, on_bar_activated=self._on_bar_activated_cb)
+        da = _GanttDrawArea(items, accent, vstart, vend, show_project_label=(self._pid is None), zoom=self._zoom, label_w_base=self._label_w, on_label_resize=self._on_label_resize_cb, color_mode=self._color_mode, on_bar_activated=self._on_bar_activated_cb)
         da.set_hexpand(False)
         # Base content width on date range (3 px/day at 1× zoom) for natural scaling
         try:
@@ -3937,6 +3961,37 @@ class HomeView(Gtk.Box):
         ov_row.connect("activated", lambda _: self._win.show_all_tasks())
         headline.add(ov_row)
 
+        # ── Monthly busyness summary ───────────────────
+        month_due, month_high, month_overdue = db_monthly_summary()
+        if month_due > 0 or month_overdue > 0:
+            if month_due >= 15:
+                level, level_cls = "Heavy", "error"
+            elif month_due >= 8:
+                level, level_cls = "Medium", "warning"
+            elif month_due >= 1:
+                level, level_cls = "Light", "success"
+            else:
+                level, level_cls = "", "dim-label"
+            sub_parts = []
+            if month_due:
+                sub_parts.append(f"{month_due} task{'s' if month_due != 1 else ''} due")
+            if month_high:
+                sub_parts.append(f"{month_high} high priority")
+            if month_overdue:
+                sub_parts.append(f"{month_overdue} overdue carrying over")
+            month_row = Adw.ActionRow(title="Next 30 days")
+            month_row.set_subtitle("  ·  ".join(sub_parts))
+            cal_icon = Gtk.Image(icon_name="office-calendar-symbolic")
+            cal_icon.set_pixel_size(20); cal_icon.add_css_class("accent")
+            month_row.add_prefix(cal_icon)
+            if level:
+                level_lbl = Gtk.Label(label=level)
+                level_lbl.add_css_class("caption")
+                level_lbl.add_css_class(level_cls)
+                level_lbl.set_valign(Gtk.Align.CENTER)
+                month_row.add_suffix(level_lbl)
+            headline.add(month_row)
+
         files_row = Adw.ActionRow(title="All linked files")
         files_row.set_subtitle("Browse files linked across all projects")
         files_icon = Gtk.Image(icon_name="folder-open-symbolic")
@@ -5017,11 +5072,11 @@ class NowPlayingBar(Gtk.Box):
             self._rev.set_reveal_child(False)
             return True
         self._player = best_name
-        title  = (best_state["title"] or "Unknown track")[:30]
+        is_playing = best_state["status"] == "Playing"
+        title  = (best_state["title"] or ("" if is_playing else "Nothing playing"))[:30]
         artist = (best_state["artist"] or "")[:28]
         self._title_lbl.set_label(title)
         self._artist_lbl.set_label(artist)
-        is_playing = best_state["status"] == "Playing"
         self._play_btn.set_icon_name(
             "media-playback-pause-symbolic" if is_playing else "media-playback-start-symbolic"
         )
