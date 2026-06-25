@@ -5140,16 +5140,32 @@ class ProjectTemplatesDialog(Adw.Window):
 # ══════════════════════════════════════════════════════
 
 class FocusModeView(Gtk.Box):
-    """Single highest-priority undone task + global Pomodoro."""
+    """Focus mode — appearance depends on focus_level setting."""
     def __init__(self, win):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=24,
-                         margin_top=48, margin_bottom=48, margin_start=48, margin_end=48)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._win = win
-        self.set_valign(Gtk.Align.CENTER); self.set_halign(Gtk.Align.CENTER)
+        self._level = get_setting("focus_level", "extreme")
+        if self._level == "extreme":
+            self.set_valign(Gtk.Align.CENTER)
+            self.set_halign(Gtk.Align.CENTER)
+            self.set_spacing(24)
+            self.set_margin_top(48); self.set_margin_bottom(48)
+            self.set_margin_start(48); self.set_margin_end(48)
+        else:
+            self.set_margin_top(12); self.set_margin_bottom(24)
+            self.set_margin_start(18); self.set_margin_end(18)
+            self.set_spacing(16)
         self._build()
 
+    # ── Extreme: single task ─────────────────────────────────────
     def _build(self):
         clear_box(self)
+        if self._level == "focused":
+            self._build_focused()
+        else:
+            self._build_extreme()
+
+    def _build_extreme(self):
         best = None; best_score = -1
         for p in db_projects():
             for t in db_todos(p["id"]):
@@ -5164,18 +5180,20 @@ class FocusModeView(Gtk.Box):
                     best = (t, p); best_score = score
 
         if not best:
-            sp = Adw.StatusPage(title="Nothing to do!", description="All tasks are done across every project",
+            sp = Adw.StatusPage(title="Nothing to do!",
+                                description="All tasks are done across every project",
                                 icon_name="checkbox-checked-symbolic")
             self.append(sp); return
 
         task, proj = best
-        proj_lbl = Gtk.Label(label=f"{safe_col(proj,'emoji') or ''} {proj['name']}".strip())
+        proj_lbl = Gtk.Label(label=(f"{safe_col(proj,'emoji') or ''} {proj['name']}").strip())
         proj_lbl.add_css_class("dim-label"); proj_lbl.add_css_class("caption")
         self.append(proj_lbl)
 
         task_lbl = Gtk.Label(label=task["text"])
         task_lbl.add_css_class("title-1"); task_lbl.set_wrap(True)
-        task_lbl.set_justify(Gtk.Justification.CENTER); task_lbl.set_max_width_chars(50)
+        task_lbl.set_justify(Gtk.Justification.CENTER)
+        task_lbl.set_max_width_chars(50)
         self.append(task_lbl)
 
         if task["priority"] == "high":
@@ -5192,6 +5210,90 @@ class FocusModeView(Gtk.Box):
         skip_btn.connect("clicked", lambda _: GLib.idle_add(self._build))
         btn_box.append(done_btn); btn_box.append(skip_btn)
         self.append(btn_box)
+
+    # ── Focused: full-context but clean ──────────────────────────
+    def _build_focused(self):
+        today = date.today().isoformat()
+
+        # Tasks due today + overdue, sorted by priority
+        tasks = db_today_tasks()
+        overdue   = [t for t in tasks if t["due_date"] < today]
+        due_today = [t for t in tasks if t["due_date"] == today]
+
+        if overdue:
+            ov_grp = Adw.PreferencesGroup(title=f"Overdue  ({len(overdue)})")
+            for t in overdue:
+                row = Adw.ActionRow(title=safe_col(t, "text") or "")
+                row.set_subtitle(safe_col(t, "project_name") or "")
+                row.set_activatable(True)
+                row.connect("activated", lambda _, pid=t["project_id"]:
+                    self._win._open_project(pid, section="tasks"))
+                pri = safe_col(t, "priority") or "normal"
+                if pri == "high":
+                    bar = Gtk.Box(); bar.set_size_request(4, -1)
+                    bar.add_css_class("error"); bar.set_valign(Gtk.Align.FILL)
+                    row.add_prefix(bar)
+                ov_grp.add(row)
+            self.append(ov_grp)
+
+        if due_today:
+            td_grp = Adw.PreferencesGroup(title=f"Due today  ({len(due_today)})")
+            for t in due_today:
+                row = Adw.ActionRow(title=safe_col(t, "text") or "")
+                row.set_subtitle(safe_col(t, "project_name") or "")
+                row.set_activatable(True)
+                row.connect("activated", lambda _, pid=t["project_id"]:
+                    self._win._open_project(pid, section="tasks"))
+                td_grp.add(row)
+            self.append(td_grp)
+
+        # Active goals (not done, not future)
+        all_goals = []
+        for p in db_projects():
+            for g in db_goals(p["id"]):
+                st = compute_goal_status(g)
+                if st in ("active", "overdue"):
+                    all_goals.append((g, p))
+        if all_goals:
+            g_grp = Adw.PreferencesGroup(title=f"Active goals  ({len(all_goals)})")
+            for g, p in all_goals[:8]:
+                row = Adw.ActionRow(title=safe_col(g, "goal") or "")
+                emoji = safe_col(p, "emoji") or ""
+                row.set_subtitle((f"{emoji} {p['name']}").strip())
+                row.set_activatable(True)
+                row.connect("activated", lambda _, pid=p["id"]:
+                    self._win._open_project(pid, section="goals"))
+                if compute_goal_status(g) == "overdue":
+                    row.add_css_class("error")
+                g_grp.add(row)
+            self.append(g_grp)
+
+        # Near-due milestones (next 14 days)
+        soon = date.today() + timedelta(days=14)
+        ms_rows = []
+        with get_db() as c:
+            ms_rows = c.execute("""
+                SELECT m.*, p.name as project_name, p.emoji as project_emoji
+                FROM milestone m JOIN project p ON m.project_id=p.id
+                WHERE m.end_date>=? AND m.end_date<=? AND (m.done IS NULL OR m.done=0)
+                ORDER BY m.end_date ASC
+            """, (today, soon.isoformat())).fetchall()
+        if ms_rows:
+            ms_grp = Adw.PreferencesGroup(title=f"Milestones due soon  ({len(ms_rows)})")
+            for m in ms_rows:
+                days_left = (date.fromisoformat(m["end_date"]) - date.today()).days
+                due_lbl = f"{days_left}d" if days_left > 0 else "today"
+                row = Adw.ActionRow(title=safe_col(m, "name") or "")
+                emoji = safe_col(m, "project_emoji") or ""
+                row.set_subtitle((f"{emoji} {m['project_name']}  ·  due {due_lbl}").strip())
+                ms_grp.add(row)
+            self.append(ms_grp)
+
+        if not tasks and not all_goals and not ms_rows:
+            sp = Adw.StatusPage(title="Clear schedule",
+                                description="Nothing urgent — great time for deep work",
+                                icon_name="checkbox-checked-symbolic")
+            self.append(sp)
 
     def _complete(self, tid):
         today = date.today().isoformat()
@@ -5558,6 +5660,31 @@ class PreferencesDialog(Adw.PreferencesWindow):
         # ── Focus / Pomodoro ──────────────────────────────────────
         focus_page = Adw.PreferencesPage(title="Focus", icon_name="clock-symbolic")
 
+        level_grp = Adw.PreferencesGroup(
+            title="Focus mode level",
+            description="Controls what appears when you open Focus mode from the menu")
+        level_row = Adw.ComboRow(title="Level")
+        level_row.set_model(Gtk.StringList.new(["Extreme", "Focused"]))
+        _focus_lvl = get_setting("focus_level", "extreme")
+        level_row.set_selected(0 if _focus_lvl == "extreme" else 1)
+        level_row.connect("notify::selected",
+            lambda r, _: set_setting("focus_level", ["extreme", "focused"][r.get_selected()]))
+
+        extreme_hint = Adw.ActionRow(title="Extreme")
+        extreme_hint.set_subtitle("One task only · timer · nothing else. Pure single-point focus.")
+        extreme_hint.set_activatable(False)
+
+        focused_hint = Adw.ActionRow(title="Focused")
+        focused_hint.set_subtitle(
+            "Timer · today's tasks + overdue across all projects · active goals · "
+            "near-due milestones. All relevant context, no project clutter.")
+        focused_hint.set_activatable(False)
+
+        level_grp.add(level_row)
+        level_grp.add(extreme_hint)
+        level_grp.add(focused_hint)
+        focus_page.add(level_grp)
+
         pomo_grp = Adw.PreferencesGroup(
             title="Pomodoro timer",
             description="Changes take effect the next time you open the timer")
@@ -5639,7 +5766,7 @@ class MainWindow(Adw.ApplicationWindow):
         home_btn.set_tooltip_text("Overview")
         home_btn.connect("clicked", lambda _: self.show_home())
         shdr.pack_start(home_btn)
-        today_btn = Gtk.Button(icon_name="appointment-symbolic")
+        today_btn = Gtk.Button(icon_name="view-list-symbolic")
         today_btn.add_css_class("flat")
         today_btn.set_tooltip_text("Today")
         today_btn.connect("clicked", lambda _: self.show_today())
@@ -5650,10 +5777,10 @@ class MainWindow(Adw.ApplicationWindow):
         coming_btn.connect("clicked", lambda _: self.show_coming_up())
         shdr.pack_start(coming_btn)
         # Pomodoro — clock icon only, no duplication
-        pomo_btn = Gtk.ToggleButton(icon_name="clock-symbolic")
-        pomo_btn.add_css_class("flat")
-        pomo_btn.set_tooltip_text("Pomodoro timer")
-        shdr.pack_end(pomo_btn)
+        self._pomo_btn = Gtk.ToggleButton(icon_name="clock-symbolic")
+        self._pomo_btn.add_css_class("flat")
+        self._pomo_btn.set_tooltip_text("Pomodoro timer")
+        shdr.pack_end(self._pomo_btn)
 
         # ── Tools menu (⋮) — groups secondary actions ──────────
         tools_popover = Gtk.Popover()
@@ -5700,7 +5827,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pomo_rev = Gtk.Revealer(reveal_child=False)
         self._pomo_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self._pomo_rev.set_child(self._pomo_widget)
-        pomo_btn.connect("toggled", lambda b: self._pomo_rev.set_reveal_child(b.get_active()))
+        self._pomo_btn.connect("toggled", lambda b: self._pomo_rev.set_reveal_child(b.get_active()))
 
         stv.add_top_bar(shdr)
         stv.add_top_bar(self._pomo_rev)   # below header bar → window controls always on top
@@ -6005,6 +6132,10 @@ class MainWindow(Adw.ApplicationWindow):
             self.show_home()
         else:
             self._show_content_view(FocusModeView(self), "Focus Mode")
+            if not self._pomo_btn.get_active():
+                self._pomo_btn.set_active(True)
+            if not self._pomo_widget._running:
+                self._pomo_widget._on_start_pause(None)
 
     def show_pinned_notes(self):
         self._show_content_view(AllPinnedNotesView(self), "Pinned Notes")
