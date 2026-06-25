@@ -550,6 +550,11 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS pomodoro_session (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                completed_at  TEXT NOT NULL,
+                duration_mins INTEGER DEFAULT 25
+            );
             CREATE TABLE IF NOT EXISTS playlist_item (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -760,6 +765,59 @@ def db_monthly_summary():
             (today,)).fetchone()[0]
     high = sum(1 for t in due if safe_col(t, "priority") == "high")
     return len(due), high, overdue_count
+
+
+def db_today_tasks():
+    """Tasks due today or overdue, sorted high→normal→low then by due_date."""
+    today = date.today().isoformat()
+    with get_db() as c:
+        return c.execute("""
+            SELECT t.*, p.name as project_name, p.color as project_color
+            FROM todo t JOIN project p ON t.project_id = p.id
+            WHERE t.done=0 AND t.due_date!='' AND t.due_date<=?
+            ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                     t.due_date ASC
+        """, (today,)).fetchall()
+
+
+def db_due_days_this_month(year, month):
+    """Return set of day-numbers (1-31) that have tasks or goals due in that month."""
+    import calendar as _cal
+    last = _cal.monthrange(year, month)[1]
+    start = f"{year:04d}-{month:02d}-01"
+    end   = f"{year:04d}-{month:02d}-{last:02d}"
+    with get_db() as c:
+        t_rows = c.execute(
+            "SELECT due_date FROM todo WHERE done=0 AND due_date>=? AND due_date<=?",
+            (start, end)).fetchall()
+        g_rows = c.execute(
+            "SELECT end_date FROM goal WHERE done=0 AND end_date>=? AND end_date<=?",
+            (start, end)).fetchall()
+    days = set()
+    for row in t_rows + g_rows:
+        val = row[0]
+        try:
+            days.add(int(val[8:10]))
+        except (TypeError, ValueError, IndexError):
+            pass
+    return days
+
+
+def db_record_pomodoro():
+    with get_db() as c:
+        c.execute("INSERT INTO pomodoro_session (completed_at, duration_mins) VALUES (?,25)",
+                  (datetime.now().isoformat(),))
+
+
+def db_pomodoro_week():
+    """Return (session_count, total_minutes) for the current calendar week (Mon–Sun)."""
+    week_start = (date.today() - timedelta(days=date.today().weekday())).isoformat()
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(duration_mins),0) as total"
+            " FROM pomodoro_session WHERE completed_at>=?",
+            (week_start,)).fetchone()
+    return (row["cnt"] or 0), (row["total"] or 0)
 
 
 def db_playlist_name(pid, project_name):
@@ -1025,6 +1083,15 @@ def color_dot(hex_color, size=14):
 
     da.set_draw_func(draw)
     return da
+
+
+def _refresh_calendar_marks(cal):
+    """Mark days that have tasks or goals due in the currently displayed month."""
+    cal.clear_marks()
+    gdt = cal.get_date()
+    days = db_due_days_this_month(gdt.get_year(), gdt.get_month())
+    for d in days:
+        cal.mark_day(d)
 
 
 def clear_box(box):
@@ -3952,6 +4019,80 @@ class ComingUpView(Gtk.Box):
             self.append(grp)
 
 
+class TodayView(Gtk.Box):
+    """Tasks due today and overdue, across all projects."""
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                         margin_top=12, margin_bottom=24,
+                         margin_start=18, margin_end=18)
+        self._win = win
+        self._build()
+
+    def _build(self):
+        clear_box(self)
+        tasks = db_today_tasks()
+        today = date.today().isoformat()
+
+        if not tasks:
+            sp = Adw.StatusPage(
+                title="Nothing due today",
+                description="Enjoy the clear schedule",
+                icon_name="checkbox-checked-symbolic",
+            )
+            sp.set_vexpand(True)
+            self.append(sp)
+            return
+
+        overdue   = [t for t in tasks if t["due_date"] < today]
+        due_today = [t for t in tasks if t["due_date"] == today]
+
+        if overdue:
+            ov_grp = Adw.PreferencesGroup(title=f"Overdue  ({len(overdue)})")
+            for t in overdue:
+                ov_grp.add(self._make_row(t, overdue=True))
+            self.append(ov_grp)
+
+        if due_today:
+            td_grp = Adw.PreferencesGroup(title=f"Due today  ({len(due_today)})")
+            for t in due_today:
+                td_grp.add(self._make_row(t))
+            self.append(td_grp)
+
+    def _make_row(self, t, overdue=False):
+        row = Adw.ActionRow(title=safe_col(t, "text") or "")
+        row.set_subtitle(safe_col(t, "project_name") or "")
+        row.set_activatable(True)
+        row.connect("activated", lambda _, pid=t["project_id"]:
+            self._win._open_project(pid, section="tasks"))
+
+        dot = color_dot(safe_col(t, "project_color") or "#4fa8c4", size=10)
+        dot.set_valign(Gtk.Align.CENTER)
+        row.add_prefix(dot)
+
+        if safe_col(t, "priority") == "high":
+            pbar = Gtk.Box(); pbar.set_size_request(4, -1)
+            pbar.add_css_class("priority-bar"); pbar.add_css_class("priority-high")
+            pbar.set_valign(Gtk.Align.FILL)
+            row.add_prefix(pbar)
+
+        if overdue:
+            try:
+                days_late = (date.today() -
+                             datetime.strptime(t["due_date"], "%Y-%m-%d").date()).days
+                late_lbl = Gtk.Label(label=f"{days_late}d late")
+                late_lbl.add_css_class("caption"); late_lbl.add_css_class("error")
+                late_lbl.set_valign(Gtk.Align.CENTER)
+                row.add_suffix(late_lbl)
+            except (ValueError, TypeError):
+                pass
+            row.add_css_class("overdue-project-row")
+
+        chev = Gtk.Image(icon_name="go-next-symbolic")
+        chev.add_css_class("dim-label")
+        row.add_suffix(chev)
+        return row
+
+
 class HomeView(Gtk.Box):
     def __init__(self, win):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -4057,6 +4198,20 @@ class HomeView(Gtk.Box):
         files_row.set_activatable(True)
         files_row.connect("activated", lambda _: self._win.show_all_files())
         headline.add(files_row)
+
+        # ── Pomodoro sessions this week ───────────────
+        pomo_count, pomo_mins = db_pomodoro_week()
+        if pomo_count > 0:
+            h, m = divmod(pomo_mins, 60)
+            pomo_time = f"{h}h {m}m" if h else f"{m}m"
+            pomo_row = Adw.ActionRow(title="Focus sessions this week")
+            pomo_row.set_subtitle(f"{pomo_count} session{'s' if pomo_count != 1 else ''}  ·  {pomo_time} of deep work")
+            t_icon = Gtk.Image()
+            t_icon.set_from_icon_name("clock-symbolic")
+            t_icon.set_pixel_size(20); t_icon.add_css_class("accent")
+            pomo_row.add_prefix(t_icon)
+            headline.add(pomo_row)
+
         self.append(headline)
 
         # ── Inspirational quote (keyed to busyness) ───
@@ -4074,6 +4229,18 @@ class HomeView(Gtk.Box):
         a_lbl.add_css_class("caption"); a_lbl.add_css_class("dim-label")
         q_box.append(a_lbl)
         self.append(q_box)
+
+        # ── Mini due-date calendar ─────────────────────
+        cal_lbl = Gtk.Label(label="Due dates this month", xalign=0)
+        cal_lbl.add_css_class("heading")
+        cal_lbl.set_margin_top(4)
+        self.append(cal_lbl)
+        cal = Gtk.Calendar()
+        cal.add_css_class("card")
+        _refresh_calendar_marks(cal)
+        cal.connect("notify::year",  lambda c, _: _refresh_calendar_marks(c))
+        cal.connect("notify::month", lambda c, _: _refresh_calendar_marks(c))
+        self.append(cal)
 
         # ── Per-project rows ──────────────────────────
         def _make_proj_row(p):
@@ -4307,6 +4474,7 @@ class PomodoroWidget(Gtk.Box):
         self._running = False; self._source_id = None
         self._start_btn.set_label("Start")
         if self._mode == "work":
+            db_record_pomodoro()           # log completed work session
             self._mode = "break"; self._secs_left = self.BREAK_SECS
             self._mode_lbl.set_text("Break")
         else:
@@ -5402,6 +5570,11 @@ class MainWindow(Adw.ApplicationWindow):
         home_btn.set_tooltip_text("Overview")
         home_btn.connect("clicked", lambda _: self.show_home())
         shdr.pack_start(home_btn)
+        today_btn = Gtk.Button(icon_name="sun-outline-symbolic")
+        today_btn.add_css_class("flat")
+        today_btn.set_tooltip_text("Today")
+        today_btn.connect("clicked", lambda _: self.show_today())
+        shdr.pack_start(today_btn)
         coming_btn = Gtk.Button(icon_name="flag-symbolic")
         coming_btn.add_css_class("flat")
         coming_btn.set_tooltip_text("Upcoming Deadlines")
@@ -5773,6 +5946,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_coming_up(self):
         self._show_content_view(ComingUpView(self), "Upcoming Deadlines")
+
+    def show_today(self):
+        self._show_content_view(TodayView(self), "Today")
 
     def show_focus_mode(self):
         if self._content_page.get_title() == "Focus Mode":
