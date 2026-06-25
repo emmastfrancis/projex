@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 import colorsys
 
 APP_ID = "io.github.emmastf.Projex"
-VERSION = "0.1.31"
+VERSION = "0.1.32"
 
 # ── Inspirational quotes, keyed by busyness level ───────────────────────
 _QUOTES = {
@@ -4158,11 +4158,13 @@ class HomeView(Gtk.Box):
         headline.add(ov_row)
 
         # ── Monthly busyness summary ───────────────────
+        _med_t   = int(get_setting("busyness_medium", "8"))
+        _heavy_t = int(get_setting("busyness_heavy",  "15"))
         month_due, month_high, month_overdue = db_monthly_summary()
         if month_due > 0 or month_overdue > 0:
-            if month_due >= 15:
+            if month_due >= _heavy_t:
                 level, level_cls = "Heavy", "error"
-            elif month_due >= 8:
+            elif month_due >= _med_t:
                 level, level_cls = "Medium", "warning"
             elif month_due >= 1:
                 level, level_cls = "Light", "success"
@@ -4215,8 +4217,8 @@ class HomeView(Gtk.Box):
         self.append(headline)
 
         # ── Inspirational quote (keyed to busyness) ───
-        q_level = ("heavy" if month_due >= 15 else
-                   "medium" if month_due >= 8 else
+        q_level = ("heavy" if month_due >= _heavy_t else
+                   "medium" if month_due >= _med_t else
                    "light" if month_due >= 1 else "clear")
         q_text, q_attr = _pick_quote(q_level)
         q_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
@@ -4412,14 +4414,14 @@ class HomeView(Gtk.Box):
 
 class PomodoroWidget(Gtk.Box):
     """Compact horizontal Pomodoro timer bar — embed in a Gtk.Revealer."""
-    WORK_SECS  = 25 * 60
-    BREAK_SECS =  5 * 60
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
                          margin_start=16, margin_end=16,
                          margin_top=6, margin_bottom=6)
-        self._secs_left = self.WORK_SECS
+        self._work_secs  = int(get_setting("pomo_work_mins",  "25")) * 60
+        self._break_secs = int(get_setting("pomo_break_mins",  "5")) * 60
+        self._secs_left = self._work_secs
         self._running   = False
         self._mode      = "work"
         self._session   = 1
@@ -4475,10 +4477,10 @@ class PomodoroWidget(Gtk.Box):
         self._start_btn.set_label("Start")
         if self._mode == "work":
             db_record_pomodoro()           # log completed work session
-            self._mode = "break"; self._secs_left = self.BREAK_SECS
+            self._mode = "break"; self._secs_left = self._break_secs
             self._mode_lbl.set_text("Break")
         else:
-            self._mode = "work"; self._session += 1; self._secs_left = self.WORK_SECS
+            self._mode = "work"; self._session += 1; self._secs_left = self._work_secs
             self._mode_lbl.set_text("Work")
             self._session_lbl.set_text(f"Session {self._session}")
         self._refresh_display()
@@ -4504,7 +4506,7 @@ class PomodoroWidget(Gtk.Box):
         self._running = False
         if self._source_id:
             GLib.source_remove(self._source_id); self._source_id = None
-        self._secs_left = self.WORK_SECS if self._mode == "work" else self.BREAK_SECS
+        self._secs_left = self._work_secs if self._mode == "work" else self._break_secs
         self._start_btn.set_label("Start"); self._refresh_display()
 
     def _cleanup(self, _):
@@ -4857,10 +4859,7 @@ class ProjectDetailView(Gtk.Box):
 
     def _open_notes(self):
         view = NotesView(self._pid, self._win, push_fn=self._push, pop_fn=self._nav.pop)
-        self._push("Notes", view,
-                   add_cb=lambda: self._push(
-                       "New Note",
-                       NoteEditView(self._pid, self._win, on_save=view._refresh, pop_fn=self._nav.pop)))
+        self._push("Notes", view)
 
     def _open_note_edit(self, note):
         self._push(
@@ -5519,6 +5518,76 @@ class PlaylistView(Gtk.Box):
         dlg.present(self._win)
 
 
+class PreferencesDialog(Adw.PreferencesWindow):
+    """App-wide preferences — opened from the hamburger menu."""
+    def __init__(self, parent):
+        super().__init__(title="Preferences", transient_for=parent, modal=True)
+        self.set_search_enabled(False)
+
+        # ── Appearance ────────────────────────────────────────────
+        app_page = Adw.PreferencesPage(title="Appearance", icon_name="display-brightness-symbolic")
+
+        scheme_grp = Adw.PreferencesGroup(title="Color scheme")
+        scheme_row = Adw.ComboRow(title="Theme")
+        scheme_row.set_model(Gtk.StringList.new(["Follow system", "Light", "Dark"]))
+        _saved = get_setting("color_scheme", "system")
+        scheme_row.set_selected({"system": 0, "light": 1, "dark": 2}.get(_saved, 0))
+        scheme_row.connect("notify::selected", self._on_scheme)
+        scheme_grp.add(scheme_row)
+        app_page.add(scheme_grp)
+
+        busy_grp = Adw.PreferencesGroup(
+            title="Monthly busyness thresholds",
+            description="Controls the Light / Medium / Heavy badge on the home page")
+        med_row = Adw.SpinRow.new_with_range(1, 50, 1)
+        med_row.set_title("Medium starts at")
+        med_row.set_subtitle("tasks due in next 30 days")
+        med_row.set_value(int(get_setting("busyness_medium", "8")))
+        med_row.connect("notify::value", lambda r, _: set_setting("busyness_medium", int(r.get_value())))
+        busy_grp.add(med_row)
+        heavy_row = Adw.SpinRow.new_with_range(1, 100, 1)
+        heavy_row.set_title("Heavy starts at")
+        heavy_row.set_subtitle("tasks due in next 30 days")
+        heavy_row.set_value(int(get_setting("busyness_heavy", "15")))
+        heavy_row.connect("notify::value", lambda r, _: set_setting("busyness_heavy", int(r.get_value())))
+        busy_grp.add(heavy_row)
+        app_page.add(busy_grp)
+
+        self.add(app_page)
+
+        # ── Focus / Pomodoro ──────────────────────────────────────
+        focus_page = Adw.PreferencesPage(title="Focus", icon_name="clock-symbolic")
+
+        pomo_grp = Adw.PreferencesGroup(
+            title="Pomodoro timer",
+            description="Changes take effect the next time you open the timer")
+        work_row = Adw.SpinRow.new_with_range(5, 120, 5)
+        work_row.set_title("Work session")
+        work_row.set_subtitle("minutes")
+        work_row.set_value(int(get_setting("pomo_work_mins", "25")))
+        work_row.connect("notify::value", lambda r, _: set_setting("pomo_work_mins", int(r.get_value())))
+        pomo_grp.add(work_row)
+        break_row = Adw.SpinRow.new_with_range(1, 60, 1)
+        break_row.set_title("Break")
+        break_row.set_subtitle("minutes")
+        break_row.set_value(int(get_setting("pomo_break_mins", "5")))
+        break_row.connect("notify::value", lambda r, _: set_setting("pomo_break_mins", int(r.get_value())))
+        pomo_grp.add(break_row)
+        focus_page.add(pomo_grp)
+
+        self.add(focus_page)
+
+    def _on_scheme(self, row, _):
+        key = ["system", "light", "dark"][row.get_selected()]
+        set_setting("color_scheme", key)
+        mgr = Adw.StyleManager.get_default()
+        mgr.set_color_scheme({
+            "system": Adw.ColorScheme.DEFAULT,
+            "light":  Adw.ColorScheme.FORCE_LIGHT,
+            "dark":   Adw.ColorScheme.FORCE_DARK,
+        }[key])
+
+
 class HelpDialog(Adw.Window):
     def __init__(self, parent):
         super().__init__(title="Help & Shortcuts", modal=True, transient_for=parent,
@@ -5570,7 +5639,7 @@ class MainWindow(Adw.ApplicationWindow):
         home_btn.set_tooltip_text("Overview")
         home_btn.connect("clicked", lambda _: self.show_home())
         shdr.pack_start(home_btn)
-        today_btn = Gtk.Button(icon_name="sun-outline-symbolic")
+        today_btn = Gtk.Button(icon_name="appointment-symbolic")
         today_btn.add_css_class("flat")
         today_btn.set_tooltip_text("Today")
         today_btn.connect("clicked", lambda _: self.show_today())
@@ -5601,33 +5670,14 @@ class MainWindow(Adw.ApplicationWindow):
             b.connect("clicked", lambda _: (tools_popover.popdown(), callback()))
             tools_box.append(b)
 
-        _mgr = Adw.StyleManager.get_default()
-        self._dark_mode = _mgr.get_dark()
+        # Apply saved color scheme on startup
+        _saved_scheme = get_setting("color_scheme", "system")
+        Adw.StyleManager.get_default().set_color_scheme({
+            "light":  Adw.ColorScheme.FORCE_LIGHT,
+            "dark":   Adw.ColorScheme.FORCE_DARK,
+        }.get(_saved_scheme, Adw.ColorScheme.DEFAULT))
 
-        def _toggle_theme():
-            self._dark_mode = not self._dark_mode
-            mgr = Adw.StyleManager.get_default()
-            if self._dark_mode:
-                mgr.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
-                theme_inner.set_icon_name("weather-clear-night-symbolic")
-                theme_txt.set_label("Switch to light mode")
-            else:
-                mgr.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
-                theme_inner.set_icon_name("display-brightness-symbolic")
-                theme_txt.set_label("Switch to dark mode")
-
-        # Theme toggle — label reflects current state (switch TO the opposite)
-        theme_row = Gtk.Button(); theme_row.add_css_class("flat")
-        theme_inner_box = Gtk.Box(spacing=10)
-        _init_icon = "weather-clear-night-symbolic" if self._dark_mode else "display-brightness-symbolic"
-        _init_lbl  = "Switch to light mode" if self._dark_mode else "Switch to dark mode"
-        theme_inner = Gtk.Image(icon_name=_init_icon)
-        theme_txt   = Gtk.Label(label=_init_lbl, xalign=0, hexpand=True)
-        theme_inner_box.append(theme_inner); theme_inner_box.append(theme_txt)
-        theme_row.set_child(theme_inner_box)
-        theme_row.connect("clicked", lambda _: (tools_popover.popdown(), _toggle_theme()))
-        tools_box.append(theme_row)
-
+        _menu_btn("Preferences",           "preferences-system-symbolic",   lambda: PreferencesDialog(self).present())
         tools_box.append(Gtk.Separator())
         _menu_btn("Focus mode",           "view-fullscreen-symbolic",       self.show_focus_mode)
         _menu_btn("Pinned notes",         "starred-symbolic",               self.show_pinned_notes)
