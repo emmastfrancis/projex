@@ -2914,11 +2914,14 @@ class TodosView(Gtk.Box):
         self._move_btn = Gtk.Button(label="Move to…")
         self._move_btn.add_css_class("flat")
         self._move_btn.connect("clicked", self._bulk_move)
+        self._goal_btn = Gtk.Button(label="Assign to goal…")
+        self._goal_btn.add_css_class("flat")
+        self._goal_btn.connect("clicked", self._bulk_assign_goal)
         cancel_btn = Gtk.Button(label="Cancel")
         cancel_btn.add_css_class("flat")
         cancel_btn.connect("clicked", lambda _: self._exit_bulk_mode())
         bulk_bar.append(self._done_btn); bulk_bar.append(self._del_btn)
-        bulk_bar.append(self._move_btn)
+        bulk_bar.append(self._move_btn); bulk_bar.append(self._goal_btn)
         bulk_bar.append(Gtk.Box(hexpand=True)); bulk_bar.append(cancel_btn)
         self._bulk_bar_rev.set_child(bulk_bar)
         self.append(self._bulk_bar_rev)
@@ -3227,11 +3230,12 @@ class TodosView(Gtk.Box):
                 bar.add_css_class(f"priority-{pri}")
                 row.add_prefix(bar)
 
-        # ── Checkbox ──────────────────────────────────────────
-        check = Gtk.CheckButton(active=is_done)
-        check.set_valign(Gtk.Align.CENTER)
-        check.connect("toggled", lambda _b, i=tid: self._toggle(i))
-        row.add_prefix(check)
+        # ── Checkbox: done toggle normally; hidden in bulk mode (sel_cb fills that role) ──
+        if not (self._bulk_mode and not is_done):
+            check = Gtk.CheckButton(active=is_done)
+            check.set_valign(Gtk.Align.CENTER)
+            check.connect("toggled", lambda _b, i=tid: self._toggle(i))
+            row.add_prefix(check)
 
         # ── Suffix: priority drop (active), edit, delete ──────
         if not is_done:
@@ -3304,6 +3308,7 @@ class TodosView(Gtk.Box):
         self._done_btn.set_label(f"Mark done ({n})" if n else "Mark done")
         self._del_btn.set_label(f"Delete ({n})" if n else "Delete")
         self._move_btn.set_label(f"Move to… ({n})" if n else "Move to…")
+        self._goal_btn.set_label(f"Assign to goal… ({n})" if n else "Assign to goal…")
 
     def _bulk_move(self, btn):
         if not self._selected_ids:
@@ -3358,6 +3363,63 @@ class TodosView(Gtk.Box):
             self._exit_bulk_mode()
         _confirm_delete(self._win, "Delete tasks?",
                         f"{n} task{'s' if n != 1 else ''} will be permanently removed.", _do)
+
+    def _bulk_assign_goal(self, btn):
+        if not self._selected_ids:
+            return
+        with get_db() as c:
+            goals = c.execute(
+                "SELECT id, text FROM goal WHERE project_id=? AND done=0 ORDER BY id",
+                (self._pid,)
+            ).fetchall()
+        popover = Gtk.Popover()
+        pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                          margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        hdr = Gtk.Label(label="Assign to goal:", xalign=0)
+        hdr.add_css_class("caption"); hdr.add_css_class("dim-label")
+        pop_box.append(hdr)
+        lb = Gtk.ListBox(); lb.add_css_class("boxed-list")
+
+        # "None" option to clear goal assignment
+        none_row = Gtk.ListBoxRow()
+        none_lbl = Gtk.Label(label="— none (clear) —", xalign=0,
+                             margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        none_lbl.add_css_class("dim-label")
+        none_row.set_child(none_lbl)
+        none_row._goal_id = None
+        lb.append(none_row)
+
+        if not goals:
+            empty = Gtk.Label(label="No active goals in this project",
+                              xalign=0, margin_start=12, margin_end=12,
+                              margin_top=4, margin_bottom=4)
+            empty.add_css_class("dim-label"); empty.add_css_class("caption")
+            pop_box.append(empty)
+        else:
+            for g in goals:
+                grow = Gtk.ListBoxRow()
+                glbl = Gtk.Label(
+                    label=g["text"], xalign=0,
+                    margin_start=12, margin_end=12, margin_top=8, margin_bottom=8,
+                    max_width_chars=32, ellipsize=3,
+                )
+                grow.set_child(glbl)
+                grow._goal_id = g["id"]
+                lb.append(grow)
+
+        def _on_goal_chosen(lb, row):
+            gid = row._goal_id
+            with get_db() as c:
+                for tid in self._selected_ids:
+                    c.execute("UPDATE todo SET goal_id=? WHERE id=?", (gid, tid))
+            popover.popdown()
+            self._exit_bulk_mode()
+
+        lb.connect("row-activated", _on_goal_chosen)
+        pop_box.append(lb)
+        popover.set_child(pop_box)
+        popover.set_parent(btn)
+        popover.popup()
 
     def _exit_bulk_mode(self):
         self._bulk_mode = False
