@@ -565,6 +565,7 @@ def init_db():
                 FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
             );
         """)
+    seed_builtin_templates()
 
 
 def migrate_db():
@@ -603,6 +604,7 @@ def migrate_db():
             "ALTER TABLE todo ADD COLUMN recur_end_date  TEXT    DEFAULT ''",
             "ALTER TABLE goal ADD COLUMN linked_note_id  INTEGER DEFAULT NULL",
             "ALTER TABLE playlist_item ADD COLUMN album TEXT DEFAULT ''",
+            "ALTER TABLE project_template ADD COLUMN builtin INTEGER DEFAULT 0",
         ]:
             try:
                 c.execute(sql)
@@ -632,6 +634,7 @@ def migrate_db():
                     )
     except Exception:
         pass
+    seed_builtin_templates()
 
 
 def get_setting(key, default=""):
@@ -683,6 +686,146 @@ def db_pt_items(tid):
         goals = c.execute("SELECT * FROM pt_goal WHERE template_id=?", (tid,)).fetchall()
         ms    = c.execute("SELECT * FROM pt_milestone WHERE template_id=?", (tid,)).fetchall()
     return todos, goals, ms
+
+def seed_builtin_templates():
+    """Insert the five example templates on first run (idempotent)."""
+    _BUILTIN = [
+        {
+            "name": "Academic Semester", "emoji": "🎓", "color": "#4fa8c4",
+            "milestones": [
+                ("Orientation", 0, 14),
+                ("Midterm Prep", 45, 21),
+                ("Final Exam Week", 90, 14),
+                ("Grades Due", 110, 7),
+            ],
+            "tasks": [
+                ("Register for courses", "high"),
+                ("Buy textbooks", "normal"),
+                ("Submit reading list", "normal"),
+                ("Set weekly study schedule", "normal"),
+                ("Form study group", "low"),
+            ],
+            "goals": [
+                "Complete all assignments on time",
+                "Attend all scheduled lectures",
+                "Finish revision before exam week",
+            ],
+        },
+        {
+            "name": "Writing Project", "emoji": "✍️", "color": "#c47a4f",
+            "milestones": [
+                ("Research & Notes", 0, 14),
+                ("Outline", 14, 7),
+                ("First Draft", 21, 30),
+                ("Revision", 51, 14),
+                ("Final / Submission", 65, 7),
+            ],
+            "tasks": [
+                ("Build reference / bibliography list", "high"),
+                ("Set daily word count target", "normal"),
+                ("Send draft to editor or peer reader", "normal"),
+                ("Final proofread", "high"),
+                ("Format for submission", "normal"),
+            ],
+            "goals": [
+                "Complete first draft",
+                "Hit target word count",
+                "Submit by deadline",
+            ],
+        },
+        {
+            "name": "Conference / Talk", "emoji": "🎤", "color": "#7a4fc4",
+            "milestones": [
+                ("Submit Proposal", 0, 7),
+                ("Proposal Accepted", 30, 1),
+                ("Slides & Materials", 60, 14),
+                ("Rehearsal Period", 80, 7),
+                ("Event Day", 90, 1),
+            ],
+            "tasks": [
+                ("Write abstract / proposal", "high"),
+                ("Book travel and accommodation", "normal"),
+                ("Prepare handout or takeaway", "normal"),
+                ("Confirm A/V requirements", "normal"),
+                ("Write bio for program", "low"),
+                ("Send thank-you emails after event", "low"),
+            ],
+            "goals": [
+                "Submit proposal on time",
+                "Rehearse talk at least three times",
+                "Receive audience feedback",
+            ],
+        },
+        {
+            "name": "Software Sprint", "emoji": "💻", "color": "#4fc47a",
+            "milestones": [
+                ("Sprint Planning", 0, 2),
+                ("Development", 2, 10),
+                ("Code Review", 12, 3),
+                ("QA & Testing", 15, 3),
+                ("Deploy", 18, 1),
+            ],
+            "tasks": [
+                ("Write or update changelog", "normal"),
+                ("Run full test suite", "high"),
+                ("Write release notes", "normal"),
+                ("Update documentation", "normal"),
+                ("Tag release in version control", "high"),
+            ],
+            "goals": [
+                "Ship on schedule",
+                "Zero critical bugs at launch",
+                "All tests passing before deploy",
+            ],
+        },
+        {
+            "name": "Event Planning", "emoji": "🎉", "color": "#c4a84f",
+            "milestones": [
+                ("Venue Booked", 0, 7),
+                ("Invitations Sent", 7, 7),
+                ("Catering Confirmed", 21, 7),
+                ("Final Head Count", 35, 3),
+                ("Event Day", 45, 1),
+            ],
+            "tasks": [
+                ("Book venue", "high"),
+                ("Design and send invitations", "high"),
+                ("Arrange catering or food", "normal"),
+                ("Confirm guest list and RSVPs", "normal"),
+                ("Set up venue on the day", "normal"),
+                ("Arrange post-event cleanup", "low"),
+            ],
+            "goals": [
+                "Stay on budget",
+                "All guests notified two weeks before",
+                "Event runs to schedule",
+            ],
+        },
+    ]
+    with get_db() as c:
+        existing = {r[0] for r in c.execute(
+            "SELECT name FROM project_template WHERE builtin=1").fetchall()}
+        for tmpl in _BUILTIN:
+            if tmpl["name"] in existing:
+                continue
+            c.execute(
+                "INSERT INTO project_template (name, description, color, emoji, builtin) "
+                "VALUES (?,?,?,?,1)",
+                (tmpl["name"], "", tmpl["color"], tmpl["emoji"]))
+            tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for title, offset, dur in tmpl.get("milestones", []):
+                c.execute(
+                    "INSERT INTO pt_milestone (template_id, title, day_offset, duration_days) "
+                    "VALUES (?,?,?,?)", (tid, title, offset, dur))
+            for text, pri in tmpl.get("tasks", []):
+                c.execute(
+                    "INSERT INTO pt_todo (template_id, text, priority) VALUES (?,?,?)",
+                    (tid, text, pri))
+            for goal_text in tmpl.get("goals", []):
+                c.execute(
+                    "INSERT INTO pt_goal (template_id, text) VALUES (?,?)",
+                    (tid, goal_text))
+
 
 def db_goals(pid):
     with get_db() as c:
@@ -4891,38 +5034,103 @@ class ProjectDetailView(Gtk.Box):
 
     def _save_as_template(self, _):
         p = self._project
-        todos = db_todos(self._pid)
+        todos = [t for t in db_todos(self._pid) if not t["done"]]
         goals = db_goals(self._pid)
+        with get_db() as c:
+            milestones = c.execute(
+                "SELECT * FROM milestone WHERE project_id=? ORDER BY start_date",
+                (self._pid,)).fetchall()
+
         dialog = Adw.Window(title="Save as Template", modal=True,
-                            transient_for=self._win, default_width=360, resizable=False)
+                            transient_for=self._win, default_width=440,
+                            default_height=560, resizable=True)
         tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
+        scroll = Gtk.ScrolledWindow(vexpand=True)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
-        grp = Adw.PreferencesGroup()
+        scroll.set_child(box); tv.set_content(scroll)
+
+        name_grp = Adw.PreferencesGroup()
         name_row = Adw.EntryRow(title="Template name")
-        name_row.set_text(p["name"] + " template" if p else "Project template")
-        grp.add(name_row); box.append(grp)
+        name_row.set_text((p["name"] + " template") if p else "Project template")
+        name_grp.add(name_row)
+        box.append(name_grp)
+
+        task_checks = []
+        goal_checks = []
+        ms_checks   = []
+
+        def _make_check_group(title, items, label_fn, checks_list):
+            if not items:
+                return
+            grp = Adw.PreferencesGroup(title=title)
+            for item in items:
+                cb = Gtk.CheckButton(active=True)
+                cb.set_valign(Gtk.Align.CENTER)
+                row = Adw.ActionRow(title=label_fn(item))
+                row.set_activatable_widget(cb)
+                row.add_prefix(cb)
+                checks_list.append((cb, item))
+                grp.add(row)
+            box.append(grp)
+
+        _make_check_group(
+            "Tasks (undone)", todos,
+            lambda t: safe_col(t, "text") or "",
+            task_checks)
+        _make_check_group(
+            "Goals", goals,
+            lambda g: safe_col(g, "text") or "",
+            goal_checks)
+        _make_check_group(
+            "Milestones", milestones,
+            lambda m: safe_col(m, "title") or "",
+            ms_checks)
+
         def _do_save(_):
             tname = name_row.get_text().strip() or "Project template"
+            sel_tasks = [item for cb, item in task_checks if cb.get_active()]
+            sel_goals = [item for cb, item in goal_checks if cb.get_active()]
+            sel_ms    = [item for cb, item in ms_checks   if cb.get_active()]
             with get_db() as c:
-                c.execute("INSERT INTO project_template (name, description, color, emoji) VALUES (?,?,?,?)",
-                          (tname, safe_col(p,"description") if p else "",
-                           p["color"] if p else "#4fa8c4",
-                           safe_col(p,"emoji") if p else ""))
+                c.execute(
+                    "INSERT INTO project_template (name, description, color, emoji, builtin) "
+                    "VALUES (?,?,?,?,0)",
+                    (tname, safe_col(p,"description") if p else "",
+                     p["color"] if p else "#4fa8c4",
+                     safe_col(p,"emoji") if p else ""))
                 tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-                for t in todos:
-                    c.execute("INSERT INTO pt_todo (template_id, text, priority, tags, recur_days) VALUES (?,?,?,?,?)",
-                              (tid, t["text"], safe_col(t,"priority") or "normal",
-                               safe_col(t,"tags") or "", int(safe_col(t,"recur_days") or 0)))
-                for g in goals:
-                    c.execute("INSERT INTO pt_goal (template_id, text, tags) VALUES (?,?,?)",
-                              (tid, g["text"], safe_col(g,"tags") or ""))
+                for t in sel_tasks:
+                    c.execute(
+                        "INSERT INTO pt_todo (template_id, text, priority, tags, recur_days) "
+                        "VALUES (?,?,?,?,?)",
+                        (tid, t["text"], safe_col(t,"priority") or "normal",
+                         safe_col(t,"tags") or "", int(safe_col(t,"recur_days") or 0)))
+                for g in sel_goals:
+                    goal_text = safe_col(g, "text") or ""
+                    c.execute(
+                        "INSERT INTO pt_goal (template_id, text, tags) VALUES (?,?,?)",
+                        (tid, goal_text, safe_col(g,"tags") or ""))
+                for m in sel_ms:
+                    try:
+                        ms_start_d = date.fromisoformat(m["start_date"])
+                        ms_end_d   = date.fromisoformat(m["end_date"])
+                        offset = (ms_start_d - date.today()).days
+                        dur    = max(1, (ms_end_d - ms_start_d).days)
+                    except Exception:
+                        offset, dur = 0, 7
+                    c.execute(
+                        "INSERT INTO pt_milestone (template_id, title, day_offset, duration_days) "
+                        "VALUES (?,?,?,?)",
+                        (tid, safe_col(m,"title") or "", offset, dur))
             dialog.close()
+
         save_btn = Gtk.Button(label="Save template", margin_top=6)
         save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
+        save_btn.set_halign(Gtk.Align.CENTER)
         save_btn.connect("clicked", _do_save)
-        box.append(save_btn); tv.set_content(box); dialog.set_content(tv)
-        dialog.present()
+        box.append(save_btn)
+        dialog.set_content(tv); dialog.present()
 
     # ── Edit / delete ──────────────────────────────────────────
 
@@ -5022,12 +5230,171 @@ class ProjectDetailView(Gtk.Box):
 # Project Templates Dialog
 # ══════════════════════════════════════════════════════
 
+class CustomTemplateDialog(Adw.Window):
+    """Build a project template from scratch."""
+    def __init__(self, parent, win, on_save=None):
+        super().__init__(title="New Custom Template", modal=True, transient_for=parent,
+                         default_width=500, default_height=620, resizable=True)
+        self._win = win
+        self._on_save = on_save
+        self._ms_entries   = []
+        self._task_entries = []
+        self._goal_entries = []
+
+        tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                        margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
+        scroll.set_child(outer); tv.set_content(scroll); self.set_content(tv)
+
+        info_grp = Adw.PreferencesGroup()
+        self._name_row  = Adw.EntryRow(title="Template name")
+        self._emoji_row = Adw.EntryRow(title="Emoji  (optional)")
+        info_grp.add(self._name_row); info_grp.add(self._emoji_row)
+        outer.append(info_grp)
+
+        def _section_header(label_text, add_cb, margin_top=8):
+            hdr = Gtk.Box(spacing=8, margin_top=margin_top)
+            lbl = Gtk.Label(label=label_text, xalign=0, hexpand=True)
+            lbl.add_css_class("heading")
+            btn = Gtk.Button(icon_name="list-add-symbolic")
+            btn.add_css_class("flat"); btn.connect("clicked", lambda _: add_cb())
+            hdr.append(lbl); hdr.append(btn)
+            return hdr
+
+        self._ms_grp   = Adw.PreferencesGroup()
+        self._task_grp = Adw.PreferencesGroup()
+        self._goal_grp = Adw.PreferencesGroup()
+
+        outer.append(_section_header("Milestones", self._add_ms_row, margin_top=4))
+        hint = Gtk.Label(
+            label="Day offset = days from project start.  Duration = length in days.",
+            xalign=0)
+        hint.add_css_class("caption"); hint.add_css_class("dim-label")
+        outer.append(hint)
+        outer.append(self._ms_grp)
+
+        outer.append(_section_header("Tasks", self._add_task_row))
+        outer.append(self._task_grp)
+
+        outer.append(_section_header("Goals", self._add_goal_row))
+        outer.append(self._goal_grp)
+
+        save_btn = Gtk.Button(label="Save template", margin_top=12)
+        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
+        save_btn.set_halign(Gtk.Align.CENTER)
+        save_btn.connect("clicked", self._save)
+        outer.append(save_btn)
+
+        self._add_ms_row(); self._add_task_row(); self._add_goal_row()
+
+    def _add_ms_row(self):
+        row = Adw.ActionRow()
+        title_e  = Gtk.Entry(placeholder_text="Milestone name", hexpand=True)
+        title_e.set_valign(Gtk.Align.CENTER)
+        offset_e = Gtk.Entry(placeholder_text="Offset", width_chars=5)
+        offset_e.set_text(str(len(self._ms_entries) * 7))
+        offset_e.set_valign(Gtk.Align.CENTER)
+        dur_e    = Gtk.Entry(placeholder_text="Days", width_chars=5)
+        dur_e.set_text("7"); dur_e.set_valign(Gtk.Align.CENTER)
+        del_btn  = Gtk.Button(icon_name="user-trash-symbolic")
+        del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
+        del_btn.set_valign(Gtk.Align.CENTER)
+        entry = (title_e, offset_e, dur_e, row)
+        del_btn.connect("clicked", lambda _, e=entry: self._remove_ms(e))
+        row.add_prefix(title_e); row.add_suffix(offset_e)
+        row.add_suffix(dur_e);   row.add_suffix(del_btn)
+        self._ms_entries.append(entry); self._ms_grp.add(row)
+
+    def _remove_ms(self, entry):
+        self._ms_entries = [e for e in self._ms_entries if e is not entry]
+        self._ms_grp.remove(entry[3])
+
+    def _add_task_row(self):
+        row = Adw.ActionRow()
+        text_e   = Gtk.Entry(placeholder_text="Task description", hexpand=True)
+        text_e.set_valign(Gtk.Align.CENTER)
+        pri_drop = Gtk.DropDown.new_from_strings(["Normal", "High", "Low"])
+        pri_drop.set_valign(Gtk.Align.CENTER)
+        del_btn  = Gtk.Button(icon_name="user-trash-symbolic")
+        del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
+        del_btn.set_valign(Gtk.Align.CENTER)
+        entry = (text_e, pri_drop, row)
+        del_btn.connect("clicked", lambda _, e=entry: self._remove_task(e))
+        row.add_prefix(text_e); row.add_suffix(pri_drop); row.add_suffix(del_btn)
+        self._task_entries.append(entry); self._task_grp.add(row)
+
+    def _remove_task(self, entry):
+        self._task_entries = [e for e in self._task_entries if e is not entry]
+        self._task_grp.remove(entry[2])
+
+    def _add_goal_row(self):
+        row = Adw.ActionRow()
+        text_e  = Gtk.Entry(placeholder_text="Goal description", hexpand=True)
+        text_e.set_valign(Gtk.Align.CENTER)
+        del_btn = Gtk.Button(icon_name="user-trash-symbolic")
+        del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
+        del_btn.set_valign(Gtk.Align.CENTER)
+        entry = (text_e, row)
+        del_btn.connect("clicked", lambda _, e=entry: self._remove_goal(e))
+        row.add_prefix(text_e); row.add_suffix(del_btn)
+        self._goal_entries.append(entry); self._goal_grp.add(row)
+
+    def _remove_goal(self, entry):
+        self._goal_entries = [e for e in self._goal_entries if e is not entry]
+        self._goal_grp.remove(entry[1])
+
+    def _save(self, _):
+        tname = self._name_row.get_text().strip()
+        if not tname:
+            self._name_row.add_css_class("error"); return
+        self._name_row.remove_css_class("error")
+        emoji = self._emoji_row.get_text().strip()
+        with get_db() as c:
+            c.execute(
+                "INSERT INTO project_template (name, description, color, emoji, builtin) "
+                "VALUES (?,?,?,?,0)", (tname, "", "#4fa8c4", emoji))
+            tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for title_e, offset_e, dur_e, _ in self._ms_entries:
+                title = title_e.get_text().strip()
+                if not title: continue
+                try: offset = int(offset_e.get_text().strip())
+                except ValueError: offset = 0
+                try: dur = max(1, int(dur_e.get_text().strip()))
+                except ValueError: dur = 7
+                c.execute(
+                    "INSERT INTO pt_milestone (template_id, title, day_offset, duration_days) "
+                    "VALUES (?,?,?,?)", (tid, title, offset, dur))
+            for text_e, pri_drop, _ in self._task_entries:
+                text = text_e.get_text().strip()
+                if not text: continue
+                pri = ["normal", "high", "low"][pri_drop.get_selected()]
+                c.execute(
+                    "INSERT INTO pt_todo (template_id, text, priority) VALUES (?,?,?)",
+                    (tid, text, pri))
+            for text_e, _ in self._goal_entries:
+                text = text_e.get_text().strip()
+                if not text: continue
+                c.execute(
+                    "INSERT INTO pt_goal (template_id, text) VALUES (?,?)",
+                    (tid, text))
+        if self._on_save: self._on_save()
+        self.close()
+
+
 class ProjectTemplatesDialog(Adw.Window):
     def __init__(self, win):
         super().__init__(title="Project Templates", modal=True, transient_for=win,
-                         default_width=520, default_height=480)
+                         default_width=540, default_height=520)
         self._win = win
-        tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
+        tv = Adw.ToolbarView()
+        hdr = Adw.HeaderBar()
+        new_btn = Gtk.Button(label="New custom")
+        new_btn.add_css_class("suggested-action")
+        new_btn.connect("clicked", lambda _: CustomTemplateDialog(
+            self, self._win, on_save=self._build).present())
+        hdr.pack_end(new_btn)
+        tv.add_top_bar(hdr)
         scroll = Gtk.ScrolledWindow(vexpand=True,
                                     margin_top=12, margin_bottom=12,
                                     margin_start=18, margin_end=18)
@@ -5038,29 +5405,47 @@ class ProjectTemplatesDialog(Adw.Window):
 
     def _build(self):
         clear_box(self._box)
-        templates = db_project_templates()
-        if not templates:
+        all_tpl = db_project_templates()
+        builtin  = [t for t in all_tpl if safe_col(t, "builtin")]
+        user_tpl = [t for t in all_tpl if not safe_col(t, "builtin")]
+
+        if not all_tpl:
             sp = Adw.StatusPage(title="No templates yet",
-                                description="Save a project as a template using the save icon in any project header",
+                                description="Save a project as a template using the save icon, or click 'New custom'",
                                 icon_name="document-open-recent-symbolic")
             sp.set_vexpand(True); self._box.append(sp); return
-        grp = Adw.PreferencesGroup(title="Saved templates")
-        for t in templates:
-            row = Adw.ActionRow(title=t["name"])
-            emoji = safe_col(t, "emoji") or ""
-            if emoji: row.set_title(f"{emoji}  {t['name']}")
-            todos, goals, ms = db_pt_items(t["id"])
-            row.set_subtitle(f"{len(todos)} tasks · {len(goals)} goals · {len(ms)} milestones")
-            apply_btn = Gtk.Button(label="Apply")
-            apply_btn.add_css_class("flat"); apply_btn.set_valign(Gtk.Align.CENTER)
-            apply_btn.connect("clicked", lambda _, tmpl=t: self._apply(tmpl))
+
+        if builtin:
+            grp = Adw.PreferencesGroup(title="Example templates")
+            for t in builtin: self._add_row(grp, t, deletable=False)
+            self._box.append(grp)
+
+        if user_tpl:
+            grp = Adw.PreferencesGroup(title="My templates")
+            for t in user_tpl: self._add_row(grp, t, deletable=True)
+            self._box.append(grp)
+
+    def _add_row(self, grp, t, deletable):
+        row = Adw.ActionRow(title=t["name"])
+        emoji = safe_col(t, "emoji") or ""
+        if emoji: row.set_title(f"{emoji}  {t['name']}")
+        todos, goals, ms = db_pt_items(t["id"])
+        parts = []
+        if ms:    parts.append(f"{len(ms)} milestone{'s' if len(ms)!=1 else ''}")
+        if todos: parts.append(f"{len(todos)} task{'s' if len(todos)!=1 else ''}")
+        if goals: parts.append(f"{len(goals)} goal{'s' if len(goals)!=1 else ''}")
+        row.set_subtitle("  ·  ".join(parts) if parts else "Empty template")
+        apply_btn = Gtk.Button(label="Apply")
+        apply_btn.add_css_class("flat"); apply_btn.set_valign(Gtk.Align.CENTER)
+        apply_btn.connect("clicked", lambda _, tmpl=t: self._apply(tmpl))
+        row.add_suffix(apply_btn)
+        if deletable:
             del_btn = Gtk.Button(icon_name="user-trash-symbolic")
             del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
             del_btn.set_valign(Gtk.Align.CENTER)
             del_btn.connect("clicked", lambda _, tid=t["id"]: self._delete(tid))
-            row.add_suffix(apply_btn); row.add_suffix(del_btn)
-            grp.add(row)
-        self._box.append(grp)
+            row.add_suffix(del_btn)
+        grp.add(row)
 
     def _apply(self, tmpl):
         todos_t, goals_t, ms_t = db_pt_items(tmpl["id"])
@@ -5077,12 +5462,12 @@ class ProjectTemplatesDialog(Adw.Window):
         start_row.set_text(date.today().isoformat())
         _wire_date_shortcut(start_row)
         grp.add(start_row)
+        parts = []
+        if ms_t:    parts.append(f"{len(ms_t)} milestone{'s' if len(ms_t)!=1 else ''}")
+        if todos_t: parts.append(f"{len(todos_t)} task{'s' if len(todos_t)!=1 else ''}")
+        if goals_t: parts.append(f"{len(goals_t)} goal{'s' if len(goals_t)!=1 else ''}")
         info = Adw.ActionRow(title="Template contents")
-        info.set_subtitle(
-            f"{len(todos_t)} task{'s' if len(todos_t)!=1 else ''}  ·  "
-            f"{len(goals_t)} goal{'s' if len(goals_t)!=1 else ''}  ·  "
-            f"{len(ms_t)} milestone{'s' if len(ms_t)!=1 else ''}"
-        )
+        info.set_subtitle("  ·  ".join(parts) if parts else "Empty")
         grp.add(info)
         box.append(grp)
         def _do_create(_):
@@ -5096,20 +5481,17 @@ class ProjectTemplatesDialog(Adw.Window):
                 c.execute(
                     "INSERT INTO project (name, status, description, color, emoji) VALUES (?,?,?,?,?)",
                     (pname, "active", safe_col(tmpl,"description") or "",
-                     tmpl["color"], safe_col(tmpl,"emoji") or ""),
-                )
+                     tmpl["color"], safe_col(tmpl,"emoji") or ""))
                 pid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
                 for i, t in enumerate(todos_t):
                     c.execute(
                         "INSERT INTO todo (project_id,text,priority,tags,order_pos,recur_days) VALUES (?,?,?,?,?,?)",
                         (pid, t["text"], safe_col(t,"priority") or "normal",
-                         safe_col(t,"tags") or "", i, int(safe_col(t,"recur_days") or 0)),
-                    )
+                         safe_col(t,"tags") or "", i, int(safe_col(t,"recur_days") or 0)))
                 for g in goals_t:
                     c.execute(
                         "INSERT INTO goal (project_id,text,tags) VALUES (?,?,?)",
-                        (pid, g["text"], safe_col(g,"tags") or ""),
-                    )
+                        (pid, g["text"], safe_col(g,"tags") or ""))
                 for m in ms_t:
                     off = int(safe_col(m,"day_offset") or 0)
                     dur = max(1, int(safe_col(m,"duration_days") or 7))
@@ -5117,17 +5499,16 @@ class ProjectTemplatesDialog(Adw.Window):
                     ms_end   = (start + timedelta(days=off + dur)).isoformat()
                     c.execute(
                         "INSERT INTO milestone (project_id,title,start_date,end_date) VALUES (?,?,?,?)",
-                        (pid, m["title"], ms_start, ms_end),
-                    )
+                        (pid, m["title"], ms_start, ms_end))
             dlg.close()
             self._win.refresh_projects(new_pid=pid)
             self.close()
         create_btn = Gtk.Button(label="Create project", margin_top=6)
         create_btn.add_css_class("suggested-action"); create_btn.add_css_class("pill")
+        create_btn.set_halign(Gtk.Align.CENTER)
         create_btn.connect("clicked", _do_create)
         box.append(create_btn)
-        tv.set_content(box); dlg.set_content(tv)
-        dlg.present()
+        tv.set_content(box); dlg.set_content(tv); dlg.present()
 
     def _delete(self, tid):
         with get_db() as c:
