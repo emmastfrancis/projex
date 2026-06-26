@@ -5878,6 +5878,7 @@ class NowPlayingBar(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self._player = None
+        self._current_state = None
 
         self._rev = Gtk.Revealer(reveal_child=False)
         self._rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
@@ -5913,7 +5914,12 @@ class NowPlayingBar(Gtk.Box):
         gc.connect("pressed", lambda _g, _n, _x, _y: mpris_raise(self._player) if self._player else None)
         info.add_controller(gc)
 
-        inner.append(ctrl); inner.append(info)
+        add_btn = Gtk.Button(icon_name="list-add-symbolic")
+        add_btn.add_css_class("flat"); add_btn.set_valign(Gtk.Align.CENTER)
+        add_btn.set_tooltip_text("Add to playlist")
+        add_btn.connect("clicked", lambda _: self._add_to_playlist())
+
+        inner.append(ctrl); inner.append(info); inner.append(add_btn)
         self._rev.set_child(inner)
         self.append(self._rev)
 
@@ -5940,6 +5946,7 @@ class NowPlayingBar(Gtk.Box):
             self._rev.set_reveal_child(False)
             return True
         self._player = best_name
+        self._current_state = best_state
         is_playing = best_state["status"] == "Playing"
         title  = (best_state["title"] or ("" if is_playing else "Nothing playing"))[:30]
         artist = (best_state["artist"] or "")[:28]
@@ -5955,6 +5962,111 @@ class NowPlayingBar(Gtk.Box):
         if self._player:
             mpris_action(self._player, action)
             GLib.timeout_add(400, self._poll)
+
+    def _add_to_playlist(self):
+        state = self._current_state
+        if not state or not state.get("title"):
+            return
+        win = self.get_root()
+        AddToPlaylistDialog(win, state).present()
+
+
+class AddToPlaylistDialog(Adw.Window):
+    """Choose an existing playlist or create a new one, then add the current track."""
+    def __init__(self, parent, track_state):
+        super().__init__(title="Add to Playlist", modal=True, transient_for=parent,
+                         default_width=420, resizable=False)
+        self._track = track_state
+
+        tv = Adw.ToolbarView(); tv.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
+        tv.set_content(box); self.set_content(tv)
+
+        # Track preview
+        track_grp = Adw.PreferencesGroup(title="Track to add")
+        track_row = Adw.ActionRow(title=track_state.get("title") or "Unknown title")
+        parts = []
+        if track_state.get("artist"): parts.append(track_state["artist"])
+        if track_state.get("album"):  parts.append(track_state["album"])
+        if parts: track_row.set_subtitle("  ·  ".join(parts))
+        track_grp.add(track_row)
+        box.append(track_grp)
+
+        # Build playlist choices: existing playlists + "New playlist…"
+        projects = [p for p in db_projects() if p["status"] != "archived"]
+        # Each project has at most one playlist; include all projects as candidates
+        existing = []  # (display_label, project_id)
+        for p in projects:
+            pl_name = db_playlist_name(p["id"], p["name"])
+            emoji = safe_col(p, "emoji") or ""
+            label = f"{pl_name}  —  {emoji} {p['name']}".strip()
+            existing.append((label, p["id"]))
+
+        dest_grp = Adw.PreferencesGroup(title="Choose playlist")
+
+        # Combo row for existing playlists
+        choice_labels = [lbl for lbl, _ in existing] + ["＋  New playlist under a project…"]
+        self._choice_drop = Adw.ComboRow(title="Playlist")
+        self._choice_drop.set_model(Gtk.StringList.new(choice_labels))
+        self._choice_drop.set_selected(0)
+        dest_grp.add(self._choice_drop)
+        box.append(dest_grp)
+
+        # "New playlist" section — revealed when last option selected
+        self._new_grp = Adw.PreferencesGroup(title="New playlist")
+        proj_labels = [f"{safe_col(p,'emoji') or ''} {p['name']}".strip() for p in projects]
+        self._proj_drop = Adw.ComboRow(title="Project")
+        self._proj_drop.set_model(Gtk.StringList.new(proj_labels))
+        self._new_grp.add(self._proj_drop)
+        self._new_name_row = Adw.EntryRow(title="Playlist name  (optional)")
+        self._new_grp.add(self._new_name_row)
+        self._new_grp.set_visible(False)
+        box.append(self._new_grp)
+
+        self._existing = existing
+        self._projects = projects
+
+        self._choice_drop.connect("notify::selected", self._on_choice)
+
+        add_btn = Gtk.Button(label="Add to playlist", margin_top=4)
+        add_btn.add_css_class("suggested-action"); add_btn.add_css_class("pill")
+        add_btn.set_halign(Gtk.Align.CENTER)
+        add_btn.connect("clicked", self._save)
+        box.append(add_btn)
+
+    def _on_choice(self, row, _):
+        is_new = row.get_selected() == len(self._existing)
+        self._new_grp.set_visible(is_new)
+
+    def _save(self, _):
+        sel = self._choice_drop.get_selected()
+        is_new = sel == len(self._existing)
+
+        if is_new:
+            proj_idx = self._proj_drop.get_selected()
+            if proj_idx >= len(self._projects):
+                return
+            project = self._projects[proj_idx]
+            pid = project["id"]
+            custom_name = self._new_name_row.get_text().strip()
+            if custom_name:
+                db_playlist_set_name(pid, custom_name)
+        else:
+            pid = self._existing[sel][1]
+
+        title  = self._track.get("title") or ""
+        artist = self._track.get("artist") or ""
+        album  = self._track.get("album") or ""
+        with get_db() as c:
+            pos = c.execute(
+                "SELECT COALESCE(MAX(position),0)+1 FROM playlist_item WHERE project_id=?",
+                (pid,)).fetchone()[0]
+            c.execute(
+                "INSERT INTO playlist_item (project_id, title, artist, album, url, position) "
+                "VALUES (?,?,?,?,?,?)",
+                (pid, title, artist, album, "", pos))
+        self.close()
 
 
 class PlaylistItemDialog(Adw.Dialog):
