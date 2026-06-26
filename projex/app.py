@@ -389,7 +389,8 @@ def mpris_get_state(player_name):
             artist = artists_raw
         else:
             artist = ", ".join(str(a) for a in artists_raw)
-        return {"title": title, "artist": artist, "album": album, "status": pb_status}
+        url = str(md.get("xesam:url", "") or "")
+        return {"title": title, "artist": artist, "album": album, "url": url, "status": pb_status}
     except Exception:
         return None
 
@@ -5994,7 +5995,15 @@ class AddToPlaylistDialog(Adw.Window):
         if track_state.get("artist"): parts.append(track_state["artist"])
         if track_state.get("album"):  parts.append(track_state["album"])
         if parts: track_row.set_subtitle("  ·  ".join(parts))
-        track_grp.add(track_row)
+        url = track_state.get("url") or ""
+        if url:
+            url_lbl = Gtk.Label(label=url[:48] + ("…" if len(url) > 48 else ""))
+            url_lbl.add_css_class("caption"); url_lbl.add_css_class("dim-label")
+            url_lbl.set_xalign(0); url_lbl.set_margin_start(12); url_lbl.set_margin_bottom(4)
+            track_grp.add(track_row)
+            track_grp.add(url_lbl)
+        else:
+            track_grp.add(track_row)
         box.append(track_grp)
 
         # Build playlist choices: existing playlists + "New playlist…"
@@ -6062,6 +6071,7 @@ class AddToPlaylistDialog(Adw.Window):
         title  = self._track.get("title") or ""
         artist = self._track.get("artist") or ""
         album  = self._track.get("album") or ""
+        url    = self._track.get("url") or ""
         with get_db() as c:
             pos = c.execute(
                 "SELECT COALESCE(MAX(position),0)+1 FROM playlist_item WHERE project_id=?",
@@ -6069,7 +6079,7 @@ class AddToPlaylistDialog(Adw.Window):
             c.execute(
                 "INSERT INTO playlist_item (project_id, title, artist, album, url, position) "
                 "VALUES (?,?,?,?,?,?)",
-                (pid, title, artist, album, "", pos))
+                (pid, title, artist, album, url, pos))
         self.close()
 
 
