@@ -296,6 +296,82 @@ def expand_date_shortcut(text):
     return parse_natural_date(text)
 
 
+def _cal_no_scroll(cal):
+    """Block scroll events from navigating calendar months (EventControllerScroll doesn't
+    fully stop propagation in GTK4; EventControllerLegacy.event returning True does)."""
+    ctrl = Gtk.EventControllerLegacy.new()
+    ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    ctrl.connect("event", lambda _c, ev: ev.get_event_type() == Gdk.EventType.SCROLL)
+    cal.add_controller(ctrl)
+
+
+def _setup_tag_autocomplete(entry_row, pid):
+    """Show a tag-suggestion popover as the user types; Enter accepts the top match."""
+    with get_db() as _c:
+        _rows = _c.execute(
+            "SELECT tags FROM todo WHERE project_id=? UNION ALL "
+            "SELECT tags FROM goal WHERE project_id=?", (pid, pid)
+        ).fetchall()
+    existing = sorted({t for row in _rows for t in get_tags(row["tags"] or "")})
+    if not existing:
+        return
+
+    popover = Gtk.Popover()
+    popover.set_has_arrow(False)
+    popover.set_position(Gtk.PositionType.BOTTOM)
+    popover.set_autohide(False)
+    sug_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    popover.set_child(sug_list)
+    popover.set_parent(entry_row)
+    _cur_sugs = [()]
+
+    def _partial():
+        words = entry_row.get_text().split()
+        last = words[-1] if words else ""
+        return last.lstrip("#").lower()
+
+    def _accept(tag):
+        parts = entry_row.get_text().split()
+        if parts and parts[-1].startswith("#"):
+            parts[-1] = f"#{tag}"
+        else:
+            parts.append(f"#{tag}")
+        entry_row.set_text(" ".join(parts) + " ")
+        popover.popdown()
+
+    def _update(*_):
+        p = _partial()
+        for ch in list(sug_list):
+            sug_list.remove(ch)
+        if not p:
+            popover.popdown(); return
+        matches = [t for t in existing if t.startswith(p) and t != p][:5]
+        _cur_sugs[0] = tuple(matches)
+        if not matches:
+            popover.popdown(); return
+        for m in matches:
+            btn = Gtk.Button(label=f"#{m}")
+            btn.add_css_class("flat")
+            btn.connect("clicked", lambda _, t=m: _accept(t))
+            sug_list.append(btn)
+        popover.popup()
+
+    entry_row.connect("notify::text", _update)
+
+    key_ctrl = Gtk.EventControllerKey.new()
+    key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def _on_key(ctrl, keyval, _kc, _st):
+        if keyval == Gdk.KEY_Return and popover.get_visible() and _cur_sugs[0]:
+            _accept(_cur_sugs[0][0])
+            return True
+        if keyval == Gdk.KEY_Escape and popover.get_visible():
+            popover.popdown()
+            return True
+        return False
+    key_ctrl.connect("key-pressed", _on_key)
+    entry_row.add_controller(key_ctrl)
+
+
 def _wire_date_shortcut(entry_row):
     """Expand date on Enter; also expand on focus-out."""
     def _expand(row, *_):
@@ -609,6 +685,7 @@ def migrate_db():
             "ALTER TABLE project_template ADD COLUMN builtin INTEGER DEFAULT 0",
             "ALTER TABLE goal ADD COLUMN today_priority INTEGER DEFAULT 0",
             "ALTER TABLE project ADD COLUMN position INTEGER DEFAULT 0",
+            "ALTER TABLE goal ADD COLUMN completed_date TEXT DEFAULT ''",
         ]:
             try:
                 c.execute(sql)
@@ -889,6 +966,17 @@ def db_goals(pid):
         return c.execute(
             "SELECT * FROM goal WHERE project_id=? "
             "ORDER BY CASE WHEN end_date='' THEN '9999-99-99' ELSE end_date END ASC, id ASC",
+            (pid,)
+        ).fetchall()
+
+
+def db_goals_early(pid):
+    """Return goals completed before or on their end_date."""
+    with get_db() as c:
+        return c.execute(
+            "SELECT * FROM goal WHERE project_id=? AND done=1 "
+            "AND end_date!='' AND completed_date!='' AND completed_date<=end_date "
+            "ORDER BY completed_date DESC",
             (pid,)
         ).fetchall()
 
@@ -2116,45 +2204,53 @@ class GoalEditDialog(Adw.Window):
 
         box.append(fields)
 
+        # Store date values internally (no text entry — calendar only)
+        self._start_val = safe_col(goal, "start_date") if goal else ""
+        self._end_val   = safe_col(goal, "end_date")   if goal else ""
+
         date_grp = Adw.PreferencesGroup(title="Dates")
-        self._start = Adw.EntryRow(title="Start date  (+Nd / +Nw / +Nm)")
-        self._start.set_text(safe_col(goal, "start_date") if goal else "")
-        self._start.connect("notify::text", lambda e, _: self._entry_changed("start"))
-        _wire_date_shortcut(self._start)
-        date_grp.add(self._start)
+        # Show current dates as read-only labels so user sees what's set
+        self._date_summary = Adw.ActionRow(title="Date range")
+        self._date_summary.set_activatable(False)
+        self._date_summary.set_subtitle(self._fmt_date_range())
+        date_grp.add(self._date_summary)
 
-        self._end = Adw.EntryRow(title="End date  (+Nd / +Nw / +Nm)")
-        self._end.set_text(safe_col(goal, "end_date") if goal else "")
-        self._end.connect("notify::text", lambda e, _: self._entry_changed("end"))
-        _wire_date_shortcut(self._end)
-        date_grp.add(self._end)
-        box.append(date_grp)
-
-        cal_label = Gtk.Label(label="Calendar sets:", xalign=0)
-        cal_label.add_css_class("caption"); cal_label.add_css_class("dim-label")
-        box.append(cal_label)
-
-        radio_box = Gtk.Box(spacing=24)
+        radio_box_row = Adw.ActionRow(title="Calendar sets")
+        radio_box_row.set_activatable(False)
+        radio_inner = Gtk.Box(spacing=24)
+        radio_inner.set_valign(Gtk.Align.CENTER)
         self._r_start = Gtk.CheckButton(label="Start date")
         self._r_end   = Gtk.CheckButton(label="End date", active=True)
         self._r_end.set_group(self._r_start)
         self._r_start.connect("toggled", self._on_radio)
         self._r_end.connect("toggled", self._on_radio)
-        radio_box.append(self._r_start); radio_box.append(self._r_end)
-        box.append(radio_box)
+        radio_inner.append(self._r_start); radio_inner.append(self._r_end)
+        radio_box_row.add_suffix(radio_inner)
+        date_grp.add(radio_box_row)
+        box.append(date_grp)
 
         self._cal = Gtk.Calendar()
         self._cal.add_css_class("card")
-        _no_scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        _no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_scroll.connect("scroll", lambda _c, _dx, _dy: True)
-        self._cal.add_controller(_no_scroll)
+        _cal_no_scroll(self._cal)
         self._cal.connect("day-selected", self._on_day_selected)
+        # Pre-select end date on calendar if set
+        if self._end_val:
+            try:
+                dt = datetime.strptime(self._end_val, "%Y-%m-%d")
+                self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+            except Exception:
+                pass
+        elif self._start_val:
+            try:
+                dt = datetime.strptime(self._start_val, "%Y-%m-%d")
+                self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+            except Exception:
+                pass
         box.append(self._cal)
 
-        for er in (self._name, self._notes_row, self._tags_row, self._start, self._end):
+        for er in (self._name, self._notes_row, self._tags_row):
             er.connect("entry-activated", self._save)
+        _setup_tag_autocomplete(self._tags_row, pid)
 
         # ── Linked / inline note ───────────────────────────────────
         note_grp = Adw.PreferencesGroup(title="Note")
@@ -2256,38 +2352,40 @@ class GoalEditDialog(Adw.Window):
         tv.set_content(scroll)
         self.set_content(tv)
 
-    def _cal_set(self, date_str):
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
-        except Exception:
-            pass
+    def _fmt_date_range(self):
+        s, e = self._start_val, self._end_val
+        if s and e:
+            return f"{s}  →  {e}"
+        if e:
+            return f"Due {e}"
+        if s:
+            return f"Starts {s}"
+        return "No dates set — click a day below"
 
     def _on_radio(self, btn):
         if not btn.get_active(): return
         self._cal_target = "start" if btn is self._r_start else "end"
-        val = self._start.get_text() if self._cal_target == "start" else self._end.get_text()
-        self._guard = True; self._cal_set(val); self._guard = False
+        val = self._start_val if self._cal_target == "start" else self._end_val
+        if val:
+            try:
+                dt = datetime.strptime(val, "%Y-%m-%d")
+                self._guard = True
+                self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
+                self._guard = False
+            except Exception:
+                pass
 
     def _on_day_selected(self, cal):
         if self._guard: return
         gdt = cal.get_date()
         ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
-        self._guard = True
-        (self._start if self._cal_target == "start" else self._end).set_text(ds)
-        self._guard = False
-
-    def _entry_changed(self, which):
-        if self._guard: return
-        if which != self._cal_target:
-            # Auto-fill start_date from end_date when start is empty
-            if which == "end" and not self._start.get_text().strip():
-                self._guard = True
-                self._start.set_text(self._end.get_text())
-                self._guard = False
-            return
-        val = self._start.get_text() if which == "start" else self._end.get_text()
-        self._guard = True; self._cal_set(val); self._guard = False
+        if self._cal_target == "start":
+            self._start_val = ds
+        else:
+            self._end_val = ds
+            if not self._start_val:
+                self._start_val = ds
+        self._date_summary.set_subtitle(self._fmt_date_range())
 
     def _save(self, *_):
         name = self._name.get_text().strip()
@@ -2295,8 +2393,8 @@ class GoalEditDialog(Adw.Window):
         priority = PRIORITIES[self._pri.get_selected()]
         tags     = normalize_tag_input(self._tags_row.get_text())
         notes    = self._notes_row.get_text().strip()
-        start    = expand_date_shortcut(self._start.get_text().strip()) or ""
-        end      = expand_date_shortcut(self._end.get_text().strip()) or ""
+        start    = self._start_val or ""
+        end      = self._end_val or ""
         done_flag = 1 if (self._goal and self._goal["done"]) else 0
         gid_for_status = self._goal["id"] if self._goal else -1
         status   = compute_goal_status({"done": done_flag, "start_date": start,
@@ -2316,18 +2414,25 @@ class GoalEditDialog(Adw.Window):
                     (self._pid, inline_text, "", date.today().isoformat())
                 )
 
+            prev_done = bool(self._goal["done"]) if self._goal else False
+            completed_date = (
+                (safe_col(self._goal, "completed_date") or date.today().isoformat())
+                if done and not prev_done else
+                (safe_col(self._goal, "completed_date") if done else "")
+            ) if self._goal else (date.today().isoformat() if done else "")
+
             if self._goal:
                 c.execute(
                     "UPDATE goal SET text=?,status=?,priority=?,tags=?,notes=?,"
-                    "start_date=?,end_date=?,done=?,due_date=?,linked_note_id=? WHERE id=?",
+                    "start_date=?,end_date=?,done=?,due_date=?,linked_note_id=?,completed_date=? WHERE id=?",
                     (name, status, priority, tags, notes, start, end, done, due_date,
-                     linked_note, self._goal["id"])
+                     linked_note, completed_date, self._goal["id"])
                 )
             else:
                 c.execute(
                     "INSERT INTO goal (project_id,text,status,priority,tags,notes,"
-                    "start_date,end_date,done,due_date,linked_note_id)"
-                    " VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+                    "start_date,end_date,done,due_date,linked_note_id,completed_date)"
+                    " VALUES (?,?,?,?,?,?,?,?,0,?,?,'')",
                     (self._pid, name, status, priority, tags, notes, start, end,
                      due_date, linked_note)
                 )
@@ -2485,46 +2590,9 @@ class TodoEditDialog(Adw.Window):
         pri_row.add_suffix(self._pri)
         grp.add(pri_row)
 
-        recur_row = Adw.ActionRow(title="Repeat")
-        self._recur_drop = Gtk.DropDown.new_from_strings(RECUR_OPTIONS)
-        self._recur_drop.set_valign(Gtk.Align.CENTER)
-        # Set current value
-        cur_recur = int(safe_col(todo, "recur_days") or 0)
-        sel = 0
-        for i, d in enumerate(RECUR_DAYS):
-            if d == cur_recur:
-                sel = i; break
-            if d > cur_recur and i > 0:  # pick closest
-                sel = i - 1; break
-        self._recur_drop.set_selected(sel)
-        recur_row.add_suffix(self._recur_drop)
-        grp.add(recur_row)
-
-        self._recur_end = Adw.EntryRow(title="Stop repeating after (date, optional)")
-        self._recur_end.set_text(safe_col(todo, "recur_end_date") or "")
-        _wire_date_shortcut(self._recur_end)
-        grp.add(self._recur_end)
-
-        # Goal assignment
-        with get_db() as c:
-            _goals = c.execute(
-                "SELECT id, text FROM goal WHERE project_id=? AND done=0 ORDER BY id",
-                (todo["project_id"],)
-            ).fetchall()
-        _goal_labels = ["— none —"] + [g["text"] for g in _goals]
-        _goal_ids    = [None] + [g["id"] for g in _goals]
-        goal_row = Adw.ActionRow(title="Assign to goal", subtitle="Optional — groups this task under a goal")
-        self._goal_drop = Gtk.DropDown.new_from_strings(_goal_labels)
-        self._goal_drop.set_valign(Gtk.Align.CENTER)
-        cur_goal = safe_col(todo, "goal_id")
-        if cur_goal and int(cur_goal or 0) in _goal_ids:
-            self._goal_drop.set_selected(_goal_ids.index(int(cur_goal)))
-        self._goal_ids = _goal_ids
-        goal_row.add_suffix(self._goal_drop)
-        grp.add(goal_row)
-
         for er in (self._text, self._tags):
             er.connect("entry-activated", self._save)
+        _setup_tag_autocomplete(self._tags, todo["project_id"])
 
         # ── Due date group with calendar ──────────────────────
         due_grp = Adw.PreferencesGroup(title="Due date")
@@ -2536,11 +2604,7 @@ class TodoEditDialog(Adw.Window):
         self._due_cal = Gtk.Calendar()
         self._due_cal.add_css_class("card")
         _cal_guard = [False]
-        _no_scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        _no_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_scroll.connect("scroll", lambda _c, _dx, _dy: True)
-        self._due_cal.add_controller(_no_scroll)
+        _cal_no_scroll(self._due_cal)
 
         def _cal_set_due(date_str):
             try:
@@ -2569,19 +2633,39 @@ class TodoEditDialog(Adw.Window):
         if safe_col(todo, "due_date"):
             _cal_set_due(safe_col(todo, "due_date"))
 
-        # ── Stop repeating calendar ───────────────────────────
-        recur_end_grp = Adw.PreferencesGroup(title="Stop repeating after")
-        recur_end_grp.set_description("Optional — leave blank to repeat forever")
-        recur_end_grp.add(self._recur_end)
+        # ── "More options" expander: repeat + goal assignment ─
+        # Auto-expand if any advanced field is already set
+        _has_recur  = int(safe_col(todo, "recur_days") or 0) > 0
+        _has_end    = bool(safe_col(todo, "recur_end_date"))
+        _has_goal   = bool(safe_col(todo, "goal_id"))
+        more_exp = Adw.ExpanderRow(title="More options")
+        more_exp.set_expanded(_has_recur or _has_end or _has_goal)
+
+        recur_row = Adw.ActionRow(title="Repeat")
+        self._recur_drop = Gtk.DropDown.new_from_strings(RECUR_OPTIONS)
+        self._recur_drop.set_valign(Gtk.Align.CENTER)
+        cur_recur = int(safe_col(todo, "recur_days") or 0)
+        sel = 0
+        for i, d in enumerate(RECUR_DAYS):
+            if d == cur_recur:
+                sel = i; break
+            if d > cur_recur and i > 0:
+                sel = i - 1; break
+        self._recur_drop.set_selected(sel)
+        recur_row.add_suffix(self._recur_drop)
+        more_exp.add_row(recur_row)
+
+        self._recur_end = Adw.EntryRow(title="Stop repeating after (leave blank = forever)")
+        self._recur_end.set_text(safe_col(todo, "recur_end_date") or "")
+        _wire_date_shortcut(self._recur_end)
+        more_exp.add_row(self._recur_end)
 
         self._recur_end_cal = Gtk.Calendar()
         self._recur_end_cal.add_css_class("card")
+        self._recur_end_cal.set_margin_start(12); self._recur_end_cal.set_margin_end(12)
+        self._recur_end_cal.set_margin_bottom(8)
         _rcal_guard = [False]
-        _no_scroll2 = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        _no_scroll2.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_scroll2.connect("scroll", lambda _c, _dx, _dy: True)
-        self._recur_end_cal.add_controller(_no_scroll2)
+        _cal_no_scroll(self._recur_end_cal)
 
         def _rcal_set(date_str):
             try:
@@ -2609,11 +2693,34 @@ class TodoEditDialog(Adw.Window):
         if safe_col(todo, "recur_end_date"):
             _rcal_set(safe_col(todo, "recur_end_date"))
 
+        # Wrap recur-end calendar in a plain row inside the expander
+        recur_cal_row = Adw.ActionRow()
+        recur_cal_row.set_activatable(False)
+        more_exp.add_row(recur_cal_row)
+        more_exp.add_row(self._recur_end_cal)
+
+        with get_db() as c:
+            _goals = c.execute(
+                "SELECT id, text FROM goal WHERE project_id=? AND done=0 ORDER BY id",
+                (todo["project_id"],)
+            ).fetchall()
+        _goal_labels = ["— none —"] + [g["text"] for g in _goals]
+        _goal_ids    = [None] + [g["id"] for g in _goals]
+        goal_row = Adw.ActionRow(title="Assign to goal")
+        goal_row.set_subtitle("Optional — groups this task under a goal")
+        self._goal_drop = Gtk.DropDown.new_from_strings(_goal_labels)
+        self._goal_drop.set_valign(Gtk.Align.CENTER)
+        cur_goal = safe_col(todo, "goal_id")
+        if cur_goal and int(cur_goal or 0) in _goal_ids:
+            self._goal_drop.set_selected(_goal_ids.index(int(cur_goal)))
+        self._goal_ids = _goal_ids
+        goal_row.add_suffix(self._goal_drop)
+        more_exp.add_row(goal_row)
+
         box.append(grp)
         box.append(due_grp)
         box.append(self._due_cal)
-        box.append(recur_end_grp)
-        box.append(self._recur_end_cal)
+        box.append(more_exp)
         btn = Gtk.Button(label="Save", margin_top=6)
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
@@ -2756,32 +2863,33 @@ class TodosView(Gtk.Box):
         self._pick_rev.set_child(pick_box)
         self.append(self._pick_rev)
 
-        # ── Due-date calendar + add button ────────────────────
-        cal_hdr = Gtk.Box(spacing=8, margin_bottom=4)
-        add_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add task (Ctrl+N)")
-        add_btn.add_css_class("suggested-action")
-        add_btn.add_css_class("circular")
-        add_btn.set_valign(Gtk.Align.CENTER)
-        add_btn.connect("clicked", lambda _: self._new_task_dialog())
-        cal_title = Gtk.Label(label="Due dates", xalign=0, hexpand=True)
+        # ── Due-date calendar ─────────────────────────────────
+        cal_title = Gtk.Label(label="Due dates", xalign=0, margin_bottom=4)
         cal_title.add_css_class("heading")
-        cal_hdr.append(cal_title)
-        cal_hdr.append(add_btn)
-        self.append(cal_hdr)
+        self.append(cal_title)
 
         self._due_cal = Gtk.Calendar()
         self._due_cal.add_css_class("card")
         # Block scroll from accidentally changing the month
-        _no_sc = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
-        _no_sc.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        _no_sc.connect("scroll", lambda _c, _dx, _dy: True)
-        self._due_cal.add_controller(_no_sc)
+        _cal_no_scroll(self._due_cal)
         self._due_cal.connect("next-month", lambda _: self._mark_due_days())
         self._due_cal.connect("prev-month", lambda _: self._mark_due_days())
         self._due_cal.connect("next-year",  lambda _: self._mark_due_days())
         self._due_cal.connect("prev-year",  lambda _: self._mark_due_days())
         self.append(self._due_cal)
+
+        # ── Overdue indicator below calendar ──────────────────
+        self._overdue_lbl = Gtk.Label(xalign=0, margin_start=4)
+        self._overdue_lbl.add_css_class("caption")
+        self.append(self._overdue_lbl)
+
+        # ── Add task button below calendar ────────────────────
+        add_task_btn = Gtk.Button(label="Add task")
+        add_task_btn.add_css_class("suggested-action"); add_task_btn.add_css_class("pill")
+        add_task_btn.set_halign(Gtk.Align.CENTER)
+        add_task_btn.set_margin_top(4); add_task_btn.set_margin_bottom(4)
+        add_task_btn.connect("clicked", lambda _: self._new_task_dialog())
+        self.append(add_task_btn)
 
         # ── Tag filter chips (rebuilt each time) ─────────────
         self._chips_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
@@ -2833,18 +2941,28 @@ class TodosView(Gtk.Box):
         self._due_cal.clear_marks()
         gdt = self._due_cal.get_date()
         yr, mo = gdt.get_year(), gdt.get_month()
+        today = date.today()
         with get_db() as c:
             rows = c.execute(
                 "SELECT due_date FROM todo WHERE project_id=? AND done=0 AND due_date!=''",
                 (self._pid,)
             ).fetchall()
+        overdue_this_month = []
         for row in rows:
             try:
                 d = datetime.strptime(row["due_date"], "%Y-%m-%d").date()
                 if d.year == yr and d.month == mo:
                     self._due_cal.mark_day(d.day)
+                if d < today:
+                    overdue_this_month.append(d)
             except ValueError:
                 pass
+        if overdue_this_month:
+            n = len(overdue_this_month)
+            self._overdue_lbl.set_text(f"● {n} overdue task{'s' if n != 1 else ''}")
+            self._overdue_lbl.add_css_class("error")
+        else:
+            self._overdue_lbl.set_text("")
 
     # ── Build ──────────────────────────────────────────────────
 
@@ -3287,6 +3405,50 @@ class TodosView(Gtk.Box):
         self._build_content()
 
 
+class EarlyGoalsDialog(Adw.Window):
+    """Shows all goals completed ahead of schedule for a project."""
+    def __init__(self, parent, pid):
+        super().__init__(title="Goals ahead of schedule",
+                         modal=True, transient_for=parent,
+                         default_width=460, default_height=520, resizable=True)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
+
+        goals = db_goals_early(pid)
+        if goals:
+            grp = Adw.PreferencesGroup(
+                title=f"{len(goals)} goal{'s' if len(goals)!=1 else ''} finished early")
+            for g in goals:
+                row = Adw.ActionRow(title=g["text"])
+                end = safe_col(g, "end_date") or ""
+                done_on = safe_col(g, "completed_date") or ""
+                if end and done_on:
+                    try:
+                        delta = (datetime.strptime(end, "%Y-%m-%d").date()
+                                 - datetime.strptime(done_on, "%Y-%m-%d").date()).days
+                        row.set_subtitle(f"Done {done_on} · {delta} day{'s' if delta!=1 else ''} early")
+                    except Exception:
+                        row.set_subtitle(f"Done {done_on}")
+                chk = Gtk.Image(icon_name="object-select-symbolic")
+                chk.add_css_class("success"); chk.set_valign(Gtk.Align.CENTER)
+                row.add_prefix(chk)
+                grp.add(row)
+            box.append(grp)
+        else:
+            empty = Adw.StatusPage(
+                icon_name="starred-symbolic",
+                title="None yet",
+                description="Goals finished before their end date will appear here.")
+            box.append(empty)
+
+        scroll.set_child(box)
+        tv.set_content(scroll)
+        self.set_content(tv)
+
+
 class GoalDetailView(Gtk.Box):
     def __init__(self, pid, goal_dict, win, push_fn=None, on_refresh=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=16,
@@ -3599,7 +3761,11 @@ class GoalsView(Gtk.Box):
 
     def _toggle_done(self, gid, done):
         with get_db() as c:
-            c.execute("UPDATE goal SET done=? WHERE id=?", (int(done), gid))
+            if done:
+                c.execute("UPDATE goal SET done=1, completed_date=? WHERE id=?",
+                          (date.today().isoformat(), gid))
+            else:
+                c.execute("UPDATE goal SET done=0, completed_date='' WHERE id=?", (gid,))
         self._refresh()
 
     def _delete(self, gid):
@@ -4493,7 +4659,8 @@ class HomeView(Gtk.Box):
                     done_btn.set_valign(Gtk.Align.CENTER)
                     def _mark_done(_, gid=g["id"]):
                         with get_db() as c:
-                            c.execute("UPDATE goal SET done=1 WHERE id=?", (gid,))
+                            c.execute("UPDATE goal SET done=1, completed_date=? WHERE id=?",
+                                      (date.today().isoformat(), gid))
                         GLib.idle_add(self._build)
                     done_btn.connect("clicked", _mark_done)
                     row.add_suffix(done_btn)
@@ -5063,6 +5230,25 @@ class ProjectDetailView(Gtk.Box):
                 for icon, title, subtitle, cb in sections[i:i+3]:
                     row_box.append(self._make_tile(icon, title, subtitle, cb))
                 outer.append(row_box)
+
+        # ── Goals ahead of schedule ───────────────────────────
+        early = db_goals_early(pid)
+        if done_g > 0:
+            early_grp = Adw.PreferencesGroup()
+            early_row = Adw.ActionRow(
+                title="Goals ahead of schedule",
+                subtitle=(f"{len(early)} of {done_g} completed goal{'s' if done_g!=1 else ''} finished early"
+                          if early else "No goals completed early yet"))
+            early_row.set_activatable(True)
+            rocket = Gtk.Image(icon_name="weather-clear-symbolic")
+            rocket.add_css_class("success" if early else "dim-label")
+            rocket.set_pixel_size(20); rocket.set_valign(Gtk.Align.CENTER)
+            early_row.add_prefix(rocket)
+            chev = Gtk.Image(icon_name="go-next-symbolic"); chev.add_css_class("dim-label")
+            early_row.add_suffix(chev)
+            early_row.connect("activated", lambda _: EarlyGoalsDialog(self._win, pid).present())
+            early_grp.add(early_row)
+            outer.append(early_grp)
 
         # ── Pinned notes pinboard ──────────────────────────────
         pinned = [n for n in notes if n["pinned"]][:3]
