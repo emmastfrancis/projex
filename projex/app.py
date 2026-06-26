@@ -605,6 +605,7 @@ def migrate_db():
             "ALTER TABLE goal ADD COLUMN linked_note_id  INTEGER DEFAULT NULL",
             "ALTER TABLE playlist_item ADD COLUMN album TEXT DEFAULT ''",
             "ALTER TABLE project_template ADD COLUMN builtin INTEGER DEFAULT 0",
+            "ALTER TABLE goal ADD COLUMN today_priority INTEGER DEFAULT 0",
         ]:
             try:
                 c.execute(sql)
@@ -921,6 +922,28 @@ def db_today_tasks():
             ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
                      t.due_date ASC
         """, (today,)).fetchall()
+
+
+def db_today_goals():
+    """Return (primary_goal, stretch_goal) — either can be None."""
+    with get_db() as c:
+        primary = c.execute(
+            "SELECT g.*, p.name as project_name, p.emoji as project_emoji, p.id as project_id "
+            "FROM goal g JOIN project p ON g.project_id=p.id "
+            "WHERE g.today_priority=1 LIMIT 1").fetchone()
+        stretch = c.execute(
+            "SELECT g.*, p.name as project_name, p.emoji as project_emoji, p.id as project_id "
+            "FROM goal g JOIN project p ON g.project_id=p.id "
+            "WHERE g.today_priority=2 LIMIT 1").fetchone()
+    return primary, stretch
+
+
+def db_set_today_goal(gid, priority):
+    """Set goal today_priority; clears any other goal already at that priority."""
+    with get_db() as c:
+        if priority > 0:
+            c.execute("UPDATE goal SET today_priority=0 WHERE today_priority=?", (priority,))
+        c.execute("UPDATE goal SET today_priority=? WHERE id=?", (priority, gid))
 
 
 def db_due_days_this_month(year, month):
@@ -3425,6 +3448,26 @@ class GoalsView(Gtk.Box):
             )
             row.add_suffix(quick_btn)
 
+            # Today / Stretch cycle button
+            _tp = int(safe_col(g, "today_priority") or 0)
+            _TODAY_STATES = [
+                ("Today?",   ["dim-label"],           "Set as today's primary goal"),
+                ("● Today",  ["accent"],              "Promote to stretch goal"),
+                ("✦ Stretch", ["warning-label"],      "Clear today assignment"),
+            ]
+            _ts_lbl_txt, _ts_css, _ts_tip = _TODAY_STATES[_tp]
+            today_lbl = Gtk.Label(label=_ts_lbl_txt)
+            for _c in _ts_css: today_lbl.add_css_class(_c)
+            today_lbl.add_css_class("caption")
+            today_btn = Gtk.Button()
+            today_btn.set_child(today_lbl)
+            today_btn.add_css_class("flat")
+            today_btn.set_valign(Gtk.Align.CENTER)
+            today_btn.set_tooltip_text(_ts_tip)
+            today_btn.connect("clicked", lambda _, gid=g["id"], cur=_tp: (
+                db_set_today_goal(gid, (cur + 1) % 3), self._refresh()))
+            row.add_suffix(today_btn)
+
             eb = Gtk.Button(icon_name="document-edit-symbolic")
             eb.add_css_class("flat"); eb.set_valign(Gtk.Align.CENTER)
             eb.connect("clicked", lambda _, gs=g_snap: GoalEditDialog(self._win, self._pid, goal=gs, on_save=self._refresh).present())
@@ -4358,6 +4401,56 @@ class HomeView(Gtk.Box):
             headline.add(pomo_row)
 
         self.append(headline)
+
+        # ── Today's goals (primary + stretch) ─────────
+        primary_g, stretch_g = db_today_goals()
+        if primary_g or stretch_g:
+            tg_grp = Adw.PreferencesGroup(title="Today's goals")
+
+            def _make_today_goal_row(g, label_text, label_css):
+                done = bool(g["done"])
+                row = Adw.ActionRow()
+                tier_lbl = Gtk.Label(label=label_text)
+                tier_lbl.add_css_class("caption"); tier_lbl.add_css_class(label_css)
+                tier_lbl.set_valign(Gtk.Align.CENTER)
+                tier_lbl.set_size_request(48, -1)
+                row.add_prefix(tier_lbl)
+
+                title = safe_col(g, "text") or ""
+                if done:
+                    row.set_title(f"✓  {title}")
+                    row.add_css_class("dim-label")
+                else:
+                    row.set_title(title)
+                proj_part = (safe_col(g, "project_emoji") or "") + "  " + (safe_col(g, "project_name") or "")
+                row.set_subtitle(proj_part.strip())
+                row.set_activatable(True)
+                row.connect("activated", lambda _, pid=g["project_id"]:
+                    self._win._open_project(pid, section="goals"))
+
+                if not done:
+                    done_btn = Gtk.Button(label="Done!")
+                    done_btn.add_css_class("flat"); done_btn.add_css_class("suggested-action")
+                    done_btn.set_valign(Gtk.Align.CENTER)
+                    def _mark_done(_, gid=g["id"]):
+                        with get_db() as c:
+                            c.execute("UPDATE goal SET done=1 WHERE id=?", (gid,))
+                        GLib.idle_add(self._build)
+                    done_btn.connect("clicked", _mark_done)
+                    row.add_suffix(done_btn)
+                return row
+
+            if primary_g:
+                tg_grp.add(_make_today_goal_row(primary_g, "Primary", "accent"))
+
+            if stretch_g:
+                row = _make_today_goal_row(stretch_g, "Stretch", "warning-label")
+                if primary_g and not primary_g["done"]:
+                    row.set_sensitive(False)
+                    row.set_tooltip_text("Complete your primary goal first")
+                tg_grp.add(row)
+
+            self.append(tg_grp)
 
         # ── Inspirational quote (keyed to busyness) ───
         q_level = ("heavy" if month_due >= _heavy_t else
