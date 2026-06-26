@@ -561,6 +561,7 @@ def init_db():
                 project_id INTEGER NOT NULL,
                 title      TEXT NOT NULL,
                 artist     TEXT DEFAULT '',
+                album      TEXT DEFAULT '',
                 url        TEXT DEFAULT '',
                 position   INTEGER DEFAULT 0,
                 FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
@@ -946,7 +947,10 @@ def db_files(pid):
 def db_playlist_items(pid):
     with get_db() as c:
         return c.execute(
-            "SELECT * FROM playlist_item WHERE project_id=? ORDER BY position, id", (pid,)
+            "SELECT id, project_id, title, "
+            "COALESCE(artist,'') AS artist, COALESCE(album,'') AS album, "
+            "COALESCE(url,'') AS url, COALESCE(position,0) AS position "
+            "FROM playlist_item WHERE project_id=? ORDER BY position, id", (pid,)
         ).fetchall()
 
 
