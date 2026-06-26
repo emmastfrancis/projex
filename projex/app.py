@@ -606,6 +606,7 @@ def migrate_db():
             "ALTER TABLE playlist_item ADD COLUMN album TEXT DEFAULT ''",
             "ALTER TABLE project_template ADD COLUMN builtin INTEGER DEFAULT 0",
             "ALTER TABLE goal ADD COLUMN today_priority INTEGER DEFAULT 0",
+            "ALTER TABLE project ADD COLUMN position INTEGER DEFAULT 0",
         ]:
             try:
                 c.execute(sql)
@@ -651,6 +652,59 @@ def set_setting(key, value):
 def db_projects():
     with get_db() as c:
         return c.execute("SELECT * FROM project ORDER BY id").fetchall()
+
+_SORT_MODES = ["manual", "alphabetical", "recently_active", "date_added",
+               "most_goals", "most_outstanding"]
+
+def db_projects_sorted(mode="manual"):
+    """Non-archived projects in sidebar sort order."""
+    with get_db() as c:
+        if mode == "alphabetical":
+            return c.execute(
+                "SELECT * FROM project WHERE status!='archived' "
+                "ORDER BY name COLLATE NOCASE ASC").fetchall()
+        elif mode == "date_added":
+            return c.execute(
+                "SELECT * FROM project WHERE status!='archived' ORDER BY id ASC").fetchall()
+        elif mode == "recently_active":
+            return c.execute("""
+                SELECT p.*,
+                    COALESCE((SELECT MAX(id) FROM todo      WHERE project_id=p.id), 0) +
+                    COALESCE((SELECT MAX(id) FROM milestone WHERE project_id=p.id), 0) +
+                    COALESCE((SELECT MAX(id) FROM note      WHERE project_id=p.id), 0) AS _act
+                FROM project p WHERE p.status!='archived'
+                ORDER BY _act DESC, p.id DESC""").fetchall()
+        elif mode == "most_goals":
+            return c.execute("""
+                SELECT p.*,
+                    (SELECT COUNT(*) FROM goal WHERE project_id=p.id AND done=0) AS _gc
+                FROM project p WHERE p.status!='archived'
+                ORDER BY _gc DESC, p.name COLLATE NOCASE ASC""").fetchall()
+        elif mode == "most_outstanding":
+            return c.execute("""
+                SELECT p.*,
+                    (SELECT COUNT(*) FROM todo WHERE project_id=p.id AND done=0) +
+                    (SELECT COUNT(*) FROM goal WHERE project_id=p.id AND done=0) AS _oc
+                FROM project p WHERE p.status!='archived'
+                ORDER BY _oc DESC, p.name COLLATE NOCASE ASC""").fetchall()
+        else:  # manual
+            return c.execute(
+                "SELECT * FROM project WHERE status!='archived' "
+                "ORDER BY COALESCE(position, id*10) ASC, id ASC").fetchall()
+
+def db_reorder_project(pid, target_pid):
+    """Move project pid to immediately before target_pid in manual order."""
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT id FROM project WHERE status!='archived' "
+            "ORDER BY COALESCE(position, id*10) ASC, id ASC").fetchall()
+        ids = [r["id"] for r in rows]
+        if pid not in ids or target_pid not in ids:
+            return
+        ids.remove(pid)
+        ids.insert(ids.index(target_pid), pid)
+        for i, rid in enumerate(ids):
+            c.execute("UPDATE project SET position=? WHERE id=?", (i * 10, rid))
 
 def db_project(pid):
     with get_db() as c:
@@ -6310,9 +6364,25 @@ class MainWindow(Adw.ApplicationWindow):
         self._search = Gtk.SearchEntry()
         self._search.set_placeholder_text("Search…")
         self._search.set_margin_start(8); self._search.set_margin_end(8)
-        self._search.set_margin_top(6);   self._search.set_margin_bottom(4)
+        self._search.set_margin_top(6);   self._search.set_margin_bottom(2)
         self._search.connect("search-changed", self._on_search)
         stv.add_top_bar(self._search)
+
+        # Sort dropdown
+        _SORT_LABELS = ["Manual order", "Alphabetical", "Most recently active",
+                        "Date added", "Most goals", "Most outstanding"]
+        self._sort_mode = get_setting("sidebar_sort", "manual")
+        _saved_sort_idx = _SORT_MODES.index(self._sort_mode) if self._sort_mode in _SORT_MODES else 0
+        self._sort_drop = Gtk.DropDown.new_from_strings(_SORT_LABELS)
+        self._sort_drop.set_selected(_saved_sort_idx)
+        self._sort_drop.set_margin_start(8); self._sort_drop.set_margin_end(8)
+        self._sort_drop.set_margin_top(2);   self._sort_drop.set_margin_bottom(4)
+        def _on_sort_changed(drop, _):
+            self._sort_mode = _SORT_MODES[drop.get_selected()]
+            set_setting("sidebar_sort", self._sort_mode)
+            self.refresh_projects()
+        self._sort_drop.connect("notify::selected", _on_sort_changed)
+        stv.add_top_bar(self._sort_drop)
 
         self._listbox = Gtk.ListBox()
         self._listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -6375,18 +6445,9 @@ class MainWindow(Adw.ApplicationWindow):
             self._listbox.remove(row)
             row = self._listbox.get_row_at_index(0)
 
+        mode = getattr(self, "_sort_mode", "manual")
+        is_manual = (mode == "manual")
         groups = {g["id"]: g for g in db_groups()}
-        projects = list(db_projects())
-
-        # Build group → projects mapping; ungrouped first
-        grouped = {}   # gid → [project_row, ...]
-        ungrouped = []
-        for p in projects:
-            gid = int(safe_col(p, "group_id") or 0)
-            if gid and gid in groups:
-                grouped.setdefault(gid, []).append(p)
-            else:
-                ungrouped.append(p)
 
         def _add_project_row(p):
             lbrow = Gtk.ListBoxRow()
@@ -6395,8 +6456,36 @@ class MainWindow(Adw.ApplicationWindow):
             lbrow._pstatus  = p["status"]
             lbrow._group_id = int(safe_col(p, "group_id") or 0)
 
-            inner = Gtk.Box(spacing=10, margin_top=9, margin_bottom=9,
-                            margin_start=12, margin_end=12)
+            inner = Gtk.Box(spacing=8, margin_top=9, margin_bottom=9,
+                            margin_start=8, margin_end=12)
+
+            # ── Drag handle (manual order only) ──────────────────
+            if is_manual:
+                handle = Gtk.Label(label="⠿")
+                handle.add_css_class("dim-label")
+                handle.set_valign(Gtk.Align.CENTER)
+                handle.set_margin_start(4)
+                try:
+                    handle.set_cursor(Gdk.Cursor.new_from_name("grab", None))
+                except Exception:
+                    pass
+                drag = Gtk.DragSource.new()
+                drag.set_actions(Gdk.DragAction.MOVE)
+                drag.connect("prepare", lambda src, x, y, i=p["id"]:
+                    Gdk.ContentProvider.new_for_value(str(i)))
+                drag.connect("drag-begin", lambda src, data, r=lbrow:
+                    src.set_icon(Gtk.WidgetPaintable.new(r), 0, 0))
+                handle.add_controller(drag)
+                inner.append(handle)
+
+                drop = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
+                drop.connect("drop", lambda tgt, val, x, y, tid=p["id"]: (
+                    db_reorder_project(int(val), tid),
+                    GLib.idle_add(self.refresh_projects),
+                    True
+                )[-1])
+                lbrow.add_controller(drop)
+
             dot = color_dot(p["color"], size=12)
             dot.set_valign(Gtk.Align.CENTER)
             inner.append(dot)
@@ -6449,63 +6538,69 @@ class MainWindow(Adw.ApplicationWindow):
             lbrow.set_child(inner)
             self._listbox.append(lbrow)
 
-        # Ungrouped projects (no header)
-        for p in ungrouped:
-            _add_project_row(p)
-
-        # Named groups with collapsible header
-        for gid, g in groups.items():
-            if gid not in grouped:
-                continue
-            # Header row
-            hrow = Gtk.ListBoxRow()
-            hrow._pid      = None
-            hrow._pname    = ""
-            hrow._pstatus  = ""
-            hrow._group_id = -1  # never filtered by group collapse itself
-            hrow.set_activatable(False)
-
-            collapsed = gid in self._collapsed_groups
-            arrow = "▶" if collapsed else "▼"
-            hinner = Gtk.Box(spacing=6, margin_top=6, margin_bottom=4,
-                             margin_start=12, margin_end=12)
-            arrow_lbl = Gtk.Label(label=arrow)
-            arrow_lbl.add_css_class("caption")
-            name_lbl = Gtk.Label(label=g["name"], xalign=0, hexpand=True)
-            name_lbl.add_css_class("caption"); name_lbl.add_css_class("group-header-row")
-            del_btn = Gtk.Button(icon_name="user-trash-symbolic")
-            del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
-            del_btn.set_valign(Gtk.Align.CENTER)
-
-            def _delete_group(_, gid=gid, gname=g["name"]):
-                def _do(gid=gid):
-                    db_delete_group(gid)
-                    self._collapsed_groups.discard(gid)
-                    self.refresh_projects()
-                _confirm_delete(self, "Delete group?",
-                                "\"" + gname + "\" will be removed. Projects in it won't be deleted.", lambda: _do())
-
-            del_btn.connect("clicked", _delete_group)
-            hinner.append(arrow_lbl); hinner.append(name_lbl); hinner.append(del_btn)
-            hrow.set_child(hinner)
-
-            gc_hdr = Gtk.GestureClick.new()
-            gc_hdr.set_button(1)
-
-            def _toggle_grp(_g, _n, _x, _y, gid=gid):
-                if gid in self._collapsed_groups:
-                    self._collapsed_groups.discard(gid)
+        if is_manual:
+            # Manual order: respect groups + position-based ordering
+            projects = list(db_projects_sorted("manual"))
+            grouped = {}
+            ungrouped = []
+            for p in projects:
+                gid = int(safe_col(p, "group_id") or 0)
+                if gid and gid in groups:
+                    grouped.setdefault(gid, []).append(p)
                 else:
-                    self._collapsed_groups.add(gid)
-                self._listbox.invalidate_filter()
-                self.refresh_projects()
+                    ungrouped.append(p)
 
-            gc_hdr.connect("pressed", _toggle_grp)
-            hinner.add_controller(gc_hdr)
+            for p in ungrouped:
+                _add_project_row(p)
 
-            self._listbox.append(hrow)
+            for gid, g in groups.items():
+                if gid not in grouped:
+                    continue
+                hrow = Gtk.ListBoxRow()
+                hrow._pid = None; hrow._pname = ""; hrow._pstatus = ""
+                hrow._group_id = -1
+                hrow.set_activatable(False)
+                collapsed = gid in self._collapsed_groups
+                hinner = Gtk.Box(spacing=6, margin_top=6, margin_bottom=4,
+                                 margin_start=12, margin_end=12)
+                arrow_lbl = Gtk.Label(label="▶" if collapsed else "▼")
+                arrow_lbl.add_css_class("caption")
+                name_lbl = Gtk.Label(label=g["name"], xalign=0, hexpand=True)
+                name_lbl.add_css_class("caption"); name_lbl.add_css_class("group-header-row")
+                del_btn = Gtk.Button(icon_name="user-trash-symbolic")
+                del_btn.add_css_class("flat"); del_btn.add_css_class("destructive-action")
+                del_btn.set_valign(Gtk.Align.CENTER)
 
-            for p in grouped[gid]:
+                def _delete_group(_, gid=gid, gname=g["name"]):
+                    def _do(gid=gid):
+                        db_delete_group(gid)
+                        self._collapsed_groups.discard(gid)
+                        self.refresh_projects()
+                    _confirm_delete(self, "Delete group?",
+                                    f"\"{gname}\" will be removed. Projects in it won't be deleted.",
+                                    lambda: _do())
+                del_btn.connect("clicked", _delete_group)
+                hinner.append(arrow_lbl); hinner.append(name_lbl); hinner.append(del_btn)
+                hrow.set_child(hinner)
+
+                gc_hdr = Gtk.GestureClick.new()
+                gc_hdr.set_button(1)
+                def _toggle_grp(_g, _n, _x, _y, gid=gid):
+                    if gid in self._collapsed_groups:
+                        self._collapsed_groups.discard(gid)
+                    else:
+                        self._collapsed_groups.add(gid)
+                    self._listbox.invalidate_filter()
+                    self.refresh_projects()
+                gc_hdr.connect("pressed", _toggle_grp)
+                hinner.add_controller(gc_hdr)
+                self._listbox.append(hrow)
+
+                for p in grouped[gid]:
+                    _add_project_row(p)
+        else:
+            # Non-manual sort: flat list, no groups, no drag handles
+            for p in db_projects_sorted(mode):
                 _add_project_row(p)
 
         if new_pid:
