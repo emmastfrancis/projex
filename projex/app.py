@@ -507,7 +507,8 @@ def init_db():
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
                 color TEXT DEFAULT '#4fa8c4',
-                emoji TEXT DEFAULT ''
+                emoji TEXT DEFAULT '',
+                builtin INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS pt_todo (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,7 +566,6 @@ def init_db():
                 FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
             );
         """)
-    seed_builtin_templates()
 
 
 def migrate_db():
