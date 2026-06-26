@@ -104,7 +104,8 @@ APP_CSS = """
 .priority-low-lbl { color: #3584e4; }
 .drag-target-row { margin-top: 44px; }
 row { transition: margin-top 200ms ease; }
-calendar .day-with-events indicator { background-color: #e01b24; border-radius: 999px; }
+calendar.overdue-cal button.marked { color: #e01b24; }
+calendar.overdue-cal button.marked indicator { background-color: #e01b24; border-radius: 999px; }
 """
 
 COLOR_PALETTE = [
@@ -324,6 +325,7 @@ def _setup_tag_autocomplete(entry_row, pid):
     popover.set_child(sug_list)
     popover.set_parent(entry_row)
     _cur_sugs = [()]
+    _accepting = [False]
 
     def _partial():
         words = entry_row.get_text().split()
@@ -331,15 +333,16 @@ def _setup_tag_autocomplete(entry_row, pid):
         return last.lstrip("#").lower()
 
     def _accept(tag):
-        parts = entry_row.get_text().split()
-        if parts and parts[-1].startswith("#"):
-            parts[-1] = f"#{tag}"
-        else:
-            parts.append(f"#{tag}")
-        entry_row.set_text(" ".join(parts) + " ")
+        _accepting[0] = True
+        p = _partial()
+        # Append only the missing suffix so existing typed chars stay
+        completion = tag[len(p):]
+        entry_row.set_text(entry_row.get_text() + completion + " ")
+        _accepting[0] = False
         popover.popdown()
 
     def _update(*_):
+        if _accepting[0]: return
         p = _partial()
         for ch in list(sug_list):
             sug_list.remove(ch)
@@ -2323,11 +2326,6 @@ class GoalEditDialog(Adw.Window):
                     tasks_grp.add(lt_row)
                 box.append(tasks_grp)
 
-        btn = Gtk.Button(label="Save")
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._save)
-        box.append(btn)
-
         if self._goal:
             conv_btn = Gtk.Button(label="Convert to task")
             conv_btn.add_css_class("flat")
@@ -2350,6 +2348,17 @@ class GoalEditDialog(Adw.Window):
         self.add_controller(sc)
         scroll.set_child(box)
         tv.set_content(scroll)
+
+        # Save pinned at the bottom so the user never has to scroll past the calendar
+        bottom_bar = Gtk.Box(margin_top=6, margin_bottom=12,
+                             margin_start=18, margin_end=18)
+        save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
+        save_btn.set_hexpand(True)
+        save_btn.connect("clicked", self._save)
+        bottom_bar.append(save_btn)
+        tv.add_bottom_bar(bottom_bar)
+
         self.set_content(tv)
 
     def _fmt_date_range(self):
@@ -2721,10 +2730,6 @@ class TodoEditDialog(Adw.Window):
         box.append(due_grp)
         box.append(self._due_cal)
         box.append(more_exp)
-        btn = Gtk.Button(label="Save", margin_top=6)
-        btn.add_css_class("suggested-action"); btn.add_css_class("pill")
-        btn.connect("clicked", self._save)
-        box.append(btn)
 
         if "id" in self._todo:
             conv_btn = Gtk.Button(label="Convert to goal")
@@ -2748,6 +2753,17 @@ class TodoEditDialog(Adw.Window):
         self.add_controller(sc)
         scroll.set_child(box)
         tv.set_content(scroll)
+
+        # Save button pinned at bottom so it's always visible without scrolling
+        bottom_bar = Gtk.Box(margin_top=6, margin_bottom=12,
+                             margin_start=18, margin_end=18)
+        save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("suggested-action"); save_btn.add_css_class("pill")
+        save_btn.set_hexpand(True)
+        save_btn.connect("clicked", self._save)
+        bottom_bar.append(save_btn)
+        tv.add_bottom_bar(bottom_bar)
+
         self.set_content(tv)
 
     def _save(self, _):
@@ -2876,6 +2892,7 @@ class TodosView(Gtk.Box):
         self._due_cal.connect("prev-month", lambda _: self._mark_due_days())
         self._due_cal.connect("next-year",  lambda _: self._mark_due_days())
         self._due_cal.connect("prev-year",  lambda _: self._mark_due_days())
+        self._due_cal.connect("day-selected", self._on_cal_day_selected)
         self.append(self._due_cal)
 
         # ── Overdue indicator below calendar ──────────────────
@@ -2942,6 +2959,7 @@ class TodosView(Gtk.Box):
 
     def _mark_due_days(self):
         self._due_cal.clear_marks()
+        self._due_cal.remove_css_class("overdue-cal")
         gdt = self._due_cal.get_date()
         yr, mo = gdt.get_year(), gdt.get_month()
         today = date.today()
@@ -2950,24 +2968,67 @@ class TodosView(Gtk.Box):
                 "SELECT due_date FROM todo WHERE project_id=? AND done=0 AND due_date!=''",
                 (self._pid,)
             ).fetchall()
-        overdue_this_month = []
+        any_overdue_in_month = False
+        upcoming_count = 0
         for row in rows:
             try:
                 d = datetime.strptime(row["due_date"], "%Y-%m-%d").date()
-                if d.year == yr and d.month == mo:
-                    self._due_cal.mark_day(d.day)
+                in_month = (d.year == yr and d.month == mo)
                 if d < today:
-                    overdue_this_month.append(d)
+                    if in_month:
+                        self._due_cal.mark_day(d.day)
+                        any_overdue_in_month = True
+                else:
+                    if in_month:
+                        upcoming_count += 1
+                        self._due_cal.mark_day(d.day)
             except ValueError:
                 pass
-        if overdue_this_month:
-            n = len(overdue_this_month)
-            self._overdue_lbl.set_text(f"● {n} overdue task{'s' if n != 1 else ''}")
+        # Red dot styling only when there are overdue days in this month
+        if any_overdue_in_month:
+            self._due_cal.add_css_class("overdue-cal")
+        # Bottom label: overdue count (all months) for at-a-glance awareness
+        total_overdue = sum(
+            1 for row in rows
+            if (lambda s: s and s < today.isoformat())(row["due_date"])
+        )
+        if total_overdue:
+            self._overdue_lbl.set_text(f"● {total_overdue} overdue")
             self._overdue_lbl.add_css_class("error")
         else:
-            self._overdue_lbl.set_text("")
+            self._overdue_lbl.set_text(
+                f"{upcoming_count} due this month" if upcoming_count else ""
+            )
+            self._overdue_lbl.remove_css_class("error")
 
     # ── Build ──────────────────────────────────────────────────
+
+    def _on_cal_day_selected(self, cal):
+        gdt = cal.get_date()
+        ds = f"{gdt.get_year():04d}-{gdt.get_month():02d}-{gdt.get_day_of_month():02d}"
+        with get_db() as c:
+            tasks = c.execute(
+                "SELECT text, priority FROM todo WHERE project_id=? AND due_date=? AND done=0",
+                (self._pid, ds)
+            ).fetchall()
+        if not tasks:
+            return
+        popover = Gtk.Popover()
+        popover.set_has_arrow(True)
+        pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                          margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
+        hdr = Gtk.Label(label=f"Due {gdt.get_day_of_month()} {gdt.get_month_name()}", xalign=0)
+        hdr.add_css_class("heading")
+        pop_box.append(hdr)
+        for t in tasks:
+            lbl = Gtk.Label(label=f"• {t['text']}", xalign=0, wrap=True, max_width_chars=36)
+            pri = t["priority"] or "normal"
+            if pri == "high":
+                lbl.add_css_class("error")
+            pop_box.append(lbl)
+        popover.set_child(pop_box)
+        popover.set_parent(cal)
+        popover.popup()
 
     def _on_tag_filter(self, tag, active):
         if active:
