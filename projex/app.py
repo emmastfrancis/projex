@@ -720,6 +720,21 @@ def migrate_db():
         pass
     seed_builtin_templates()
 
+    # Ensure system Inbox project exists
+    with get_db() as c:
+        inbox = c.execute("SELECT id FROM project WHERE status='system_inbox' LIMIT 1").fetchone()
+        if not inbox:
+            c.execute(
+                "INSERT INTO project (name, status, description, color, sort_order) "
+                "VALUES ('Inbox', 'system_inbox', 'General tasks not tied to a project', '#888888', -1)"
+            )
+
+
+def get_inbox_pid():
+    with get_db() as c:
+        row = c.execute("SELECT id FROM project WHERE status='system_inbox' LIMIT 1").fetchone()
+        return row[0] if row else None
+
 
 def get_setting(key, default=""):
     with get_db() as c:
@@ -733,7 +748,7 @@ def set_setting(key, value):
 
 def db_projects():
     with get_db() as c:
-        return c.execute("SELECT * FROM project ORDER BY id").fetchall()
+        return c.execute("SELECT * FROM project WHERE status != 'system_inbox' ORDER BY id").fetchall()
 
 _SORT_MODES = ["manual", "alphabetical", "recently_active", "date_added",
                "most_goals", "most_outstanding"]
@@ -743,35 +758,35 @@ def db_projects_sorted(mode="manual"):
     with get_db() as c:
         if mode == "alphabetical":
             return c.execute(
-                "SELECT * FROM project WHERE status!='archived' "
+                "SELECT * FROM project WHERE status!='archived' AND status!='system_inbox' "
                 "ORDER BY name COLLATE NOCASE ASC").fetchall()
         elif mode == "date_added":
             return c.execute(
-                "SELECT * FROM project WHERE status!='archived' ORDER BY id ASC").fetchall()
+                "SELECT * FROM project WHERE status!='archived' AND status!='system_inbox' ORDER BY id ASC").fetchall()
         elif mode == "recently_active":
             return c.execute("""
                 SELECT p.*,
                     COALESCE((SELECT MAX(id) FROM todo      WHERE project_id=p.id), 0) +
                     COALESCE((SELECT MAX(id) FROM milestone WHERE project_id=p.id), 0) +
                     COALESCE((SELECT MAX(id) FROM note      WHERE project_id=p.id), 0) AS _act
-                FROM project p WHERE p.status!='archived'
+                FROM project p WHERE p.status!='archived' AND p.status!='system_inbox'
                 ORDER BY _act DESC, p.id DESC""").fetchall()
         elif mode == "most_goals":
             return c.execute("""
                 SELECT p.*,
                     (SELECT COUNT(*) FROM goal WHERE project_id=p.id AND done=0) AS _gc
-                FROM project p WHERE p.status!='archived'
+                FROM project p WHERE p.status!='archived' AND p.status!='system_inbox'
                 ORDER BY _gc DESC, p.name COLLATE NOCASE ASC""").fetchall()
         elif mode == "most_outstanding":
             return c.execute("""
                 SELECT p.*,
                     (SELECT COUNT(*) FROM todo WHERE project_id=p.id AND done=0) +
                     (SELECT COUNT(*) FROM goal WHERE project_id=p.id AND done=0) AS _oc
-                FROM project p WHERE p.status!='archived'
+                FROM project p WHERE p.status!='archived' AND p.status!='system_inbox'
                 ORDER BY _oc DESC, p.name COLLATE NOCASE ASC""").fetchall()
         else:  # manual
             return c.execute(
-                "SELECT * FROM project WHERE status!='archived' "
+                "SELECT * FROM project WHERE status!='archived' AND status!='system_inbox' "
                 "ORDER BY COALESCE(position, id*10) ASC, id ASC").fetchall()
 
 def db_reorder_project(pid, target_pid):
@@ -2025,13 +2040,16 @@ class ProjectDialog(Adw.Window):
 
         self._custom_btn.connect("color-set", _on_custom)
 
-        suffix_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-        suffix_box.append(swatch_flow)
-        suffix_box.append(self._custom_btn)
-        color_row.add_suffix(suffix_box)
+        color_row.add_suffix(self._custom_btn)
         grp.add(color_row)
 
         box.append(grp)
+        # Swatches in a full-width row below the color ActionRow so they scale with window width
+        swatch_outer = Gtk.Box(margin_start=18, margin_end=18, margin_top=4, margin_bottom=8)
+        swatch_flow.set_hexpand(True)
+        swatch_flow.set_max_children_per_line(99)
+        swatch_outer.append(swatch_flow)
+        box.append(swatch_outer)
         btn = Gtk.Button(label="Save", margin_top=18)
         btn.add_css_class("suggested-action"); btn.add_css_class("pill")
         btn.connect("clicked", self._save)
@@ -2236,7 +2254,8 @@ class GoalEditDialog(Adw.Window):
         self._cal.add_css_class("card")
         _cal_no_scroll(self._cal)
         self._cal.connect("day-selected", self._on_day_selected)
-        # Pre-select end date on calendar if set
+        # Pre-select end date on calendar if set (guard so signal doesn't fire)
+        self._guard = True
         if self._end_val:
             try:
                 dt = datetime.strptime(self._end_val, "%Y-%m-%d")
@@ -2249,6 +2268,13 @@ class GoalEditDialog(Adw.Window):
                 self._cal.select_day(GLib.DateTime.new_local(dt.year, dt.month, dt.day, 0, 0, 0.0))
             except Exception:
                 pass
+        self._guard = False
+        # GestureClick handles re-clicking an already-selected date (day-selected won't fire)
+        click_ctrl = Gtk.GestureClick.new()
+        def _on_cal_click(g, n, x, y):
+            self._on_day_selected(self._cal)
+        click_ctrl.connect("released", _on_cal_click)
+        self._cal.add_controller(click_ctrl)
         box.append(self._cal)
 
         for er in (self._name, self._notes_row, self._tags_row):
@@ -2412,16 +2438,21 @@ class GoalEditDialog(Adw.Window):
         due_date = end
         linked_note = self._note_ids[self._note_drop.get_selected()]
 
-        # Save inline note to the project's Notes section (independent of linked_note)
         buf = self._inline_note.get_buffer()
         inline_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
 
         with get_db() as c:
+            # Insert inline note if provided, then link it back to the goal
             if inline_text:
                 c.execute(
                     "INSERT INTO note (project_id,content,tags,created_date) VALUES (?,?,?,?)",
                     (self._pid, inline_text, "", date.today().isoformat())
                 )
+                new_note_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+                linked_note = new_note_id  # override dropdown selection
+                # Use snippet as notes preview if notes field is empty
+                if not notes:
+                    notes = inline_text[:60] + ("…" if len(inline_text) > 60 else "")
 
             prev_done = bool(self._goal["done"]) if self._goal else False
             completed_date = (
@@ -3612,6 +3643,32 @@ class GoalDetailView(Gtk.Box):
             on_save=lambda: (self._build(), self._on_refresh() if self._on_refresh else None)
         ).present())
         self.append(edit_btn)
+
+        # Add Task / Add Note buttons
+        action_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        add_task_btn = Gtk.Button(label="Add task")
+        add_task_btn.add_css_class("pill")
+        def _add_task(_):
+            TodoEditDialog(
+                self._win,
+                {"text": "", "priority": "normal", "project_id": self._pid, "goal_id": g["id"]},
+                on_save=self._build
+            ).present()
+        add_task_btn.connect("clicked", _add_task)
+        action_box.append(add_task_btn)
+
+        add_note_btn = Gtk.Button(label="Add note")
+        add_note_btn.add_css_class("pill")
+        def _add_note(_):
+            if self._push_fn:
+                view = NoteEditView(self._pid, self._win, on_save=self._build, pop_fn=None)
+                self._push_fn("New Note", view)
+            else:
+                import logging
+                logging.warning("GoalDetailView: push_fn not available, cannot push NoteEditView")
+        add_note_btn.connect("clicked", _add_note)
+        action_box.append(add_note_btn)
+        self.append(action_box)
 
         # Linked tasks
         with get_db() as c:
@@ -6739,6 +6796,11 @@ class MainWindow(Adw.ApplicationWindow):
         coming_btn.set_tooltip_text("Upcoming Deadlines")
         coming_btn.connect("clicked", lambda _: self.show_coming_up())
         shdr.pack_start(coming_btn)
+        inbox_btn = Gtk.Button(icon_name="mail-unread-symbolic")
+        inbox_btn.add_css_class("flat")
+        inbox_btn.set_tooltip_text("Inbox (general tasks)")
+        inbox_btn.connect("clicked", lambda _: self.show_inbox())
+        shdr.pack_start(inbox_btn)
         # Pomodoro — clock icon only, no duplication
         self._pomo_btn = Gtk.ToggleButton(icon_name="clock-symbolic")
         self._pomo_btn.add_css_class("flat")
@@ -7127,6 +7189,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_coming_up(self):
         self._show_content_view(ComingUpView(self), "Upcoming Deadlines")
+
+    def show_inbox(self):
+        pid = get_inbox_pid()
+        if pid is None:
+            return
+        self._show_content_view(TodosView(pid, self), "Inbox")
 
     def show_today(self):
         self._show_content_view(TodayView(self), "Today")
